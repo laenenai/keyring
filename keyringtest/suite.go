@@ -153,6 +153,163 @@ func RunKeyManagerSuite(t *testing.T, newKM func(t *testing.T) keyring.KeyManage
 		}
 	})
 
+	// GenerateDEKMintsAKeyInsideTheKeyManager covers the method that exists
+	// so a caller never has to mint key material itself: the DEK is produced
+	// by the key manager — from the key store's own entropy, where there is
+	// one — and comes back together with the record to persist.
+	t.Run("GenerateDEKMintsAKeyInsideTheKeyManager", func(t *testing.T) {
+		km := newKM(t)
+		ctx := context.Background()
+		kekID, keyID := newKEKID(t), newKeyID(t)
+
+		dek, wrapped, err := km.GenerateDEK(ctx, kekID, keyID)
+		if err != nil {
+			t.Fatalf("GenerateDEK: %v", err)
+		}
+		t.Cleanup(dek.Destroy)
+		if err := dek.Validate(); err != nil {
+			t.Fatalf("GenerateDEK returned unusable key material: %v", err)
+		}
+		material := bytes.Clone(dek.Bytes())
+
+		if err := wrapped.Validate(); err != nil {
+			t.Fatalf("GenerateDEK returned a record that does not validate: %v", err)
+		}
+		if wrapped.KEKID != kekID {
+			t.Errorf("wrapped.KEKID = %q, want %q", wrapped.KEKID, kekID)
+		}
+		if wrapped.KeyID != keyID {
+			t.Errorf("wrapped.KeyID = %q, want %q", wrapped.KeyID, keyID)
+		}
+		// The KEK did not exist before this call: GenerateDEK creates it, on
+		// the same terms as WrapDEK does.
+		if wrapped.KEKVersion < keyring.FirstKEKVersion {
+			t.Errorf("wrapped.KEKVersion = %s, want at least %s", wrapped.KEKVersion, keyring.FirstKEKVersion)
+		}
+		assertNoKeyMaterial(t, "GenerateDEK ciphertext", string(wrapped.Ciphertext), material)
+
+		// The record round-trips, which is the only thing that makes the
+		// returned DEK useful: a caller encrypts with the DEK, stores the
+		// record, and must get the same key back.
+		got, err := km.UnwrapDEK(ctx, wrapped)
+		if err != nil {
+			t.Fatalf("UnwrapDEK of a GenerateDEK record: %v", err)
+		}
+		t.Cleanup(got.Destroy)
+		if !bytes.Equal(got.Bytes(), material) {
+			t.Fatal("the record GenerateDEK returned unwrapped to different key material than the DEK it returned")
+		}
+
+		// And the record names the KEK's current version, so a GenerateDEK
+		// after a rotation is wrapped under the new one.
+		rotated, err := km.RotateKEK(ctx, kekID)
+		if err != nil {
+			t.Fatalf("RotateKEK: %v", err)
+		}
+		afterRotation, nextWrapped, err := km.GenerateDEK(ctx, kekID, newKeyID(t))
+		if err != nil {
+			t.Fatalf("GenerateDEK after RotateKEK: %v", err)
+		}
+		t.Cleanup(afterRotation.Destroy)
+		if nextWrapped.KEKVersion != rotated {
+			t.Errorf("GenerateDEK after RotateKEK recorded %s, want the new current version %s",
+				nextWrapped.KEKVersion, rotated)
+		}
+	})
+
+	// GenerateDEKReturnsIndependentlyOwnedDEKs is the same ownership rule
+	// UnwrapDEK has, asserted here too because a key manager that minted DEKs
+	// from a shared buffer — or handed out the same key twice — would be a
+	// catastrophic adapter that a single-call test cannot detect.
+	t.Run("GenerateDEKReturnsIndependentlyOwnedDEKs", func(t *testing.T) {
+		km := newKM(t)
+		ctx := context.Background()
+		kekID := newKEKID(t)
+
+		first, firstRecord, err := km.GenerateDEK(ctx, kekID, newKeyID(t))
+		if err != nil {
+			t.Fatalf("first GenerateDEK: %v", err)
+		}
+		second, secondRecord, err := km.GenerateDEK(ctx, kekID, newKeyID(t))
+		if err != nil {
+			t.Fatalf("second GenerateDEK: %v", err)
+		}
+		t.Cleanup(second.Destroy)
+
+		if first.Equal(second) {
+			t.Fatal("two GenerateDEK calls returned the same key material")
+		}
+		secondMaterial := bytes.Clone(second.Bytes())
+
+		// Destroying one must not reach into the other, nor into anything the
+		// adapter kept: these are two independent secrets.
+		first.Destroy()
+		if !bytes.Equal(second.Bytes(), secondMaterial) {
+			t.Fatal("destroying one generated DEK invalidated another")
+		}
+
+		// Both records still open, and to the keys they were generated with:
+		// destroying the caller's copy of a DEK says nothing about the record.
+		reopened, err := km.UnwrapDEK(ctx, secondRecord)
+		if err != nil {
+			t.Fatalf("UnwrapDEK of the second record: %v", err)
+		}
+		t.Cleanup(reopened.Destroy)
+		if !bytes.Equal(reopened.Bytes(), secondMaterial) {
+			t.Fatal("the second record unwrapped to the wrong key material")
+		}
+		stillGood, err := km.UnwrapDEK(ctx, firstRecord)
+		if err != nil {
+			t.Fatalf("UnwrapDEK of the first record after destroying its DEK: %v", err)
+		}
+		t.Cleanup(stillGood.Destroy)
+		if stillGood.IsZero() {
+			t.Fatal("the first record unwrapped to no key material after its generated DEK was destroyed")
+		}
+	})
+
+	t.Run("GenerateDEKFailsClosed", func(t *testing.T) {
+		km := newKM(t)
+		ctx := context.Background()
+		kekID, keyID := newKEKID(t), newKeyID(t)
+
+		destroyed := newKEKID(t)
+		if _, _, err := km.GenerateDEK(ctx, destroyed, keyID); err != nil {
+			t.Fatalf("GenerateDEK under the KEK about to be destroyed: %v", err)
+		}
+		if err := km.DestroyKEK(ctx, destroyed); err != nil {
+			t.Fatalf("DestroyKEK: %v", err)
+		}
+
+		cases := []struct {
+			name    string
+			kekID   keyring.KEKID
+			keyID   keyring.KeyID
+			wantErr error
+		}{
+			{"empty_kek_id", "", keyID, keyring.ErrInvalidIdentifier},
+			{"empty_key_id", kekID, "", keyring.ErrInvalidIdentifier},
+			{"kek_id_with_separator", "a/b", keyID, keyring.ErrInvalidIdentifier},
+			{"key_id_with_null_byte", kekID, keyring.KeyID("a\x00b"), keyring.ErrInvalidIdentifier},
+			{"over_long_kek_id", keyring.KEKID(strings.Repeat("x", 257)), keyID, keyring.ErrInvalidIdentifier},
+			// A shredded KEK is never resurrected, by any door: generating a
+			// DEK under one must fail exactly as wrapping under one does.
+			{"destroyed_kek", destroyed, keyID, keyring.ErrKEKDestroyed},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				dek, wrapped, err := km.GenerateDEK(ctx, tc.kekID, tc.keyID)
+				if !errors.Is(err, tc.wantErr) {
+					t.Fatalf("GenerateDEK(%s) error = %v, want %v", tc.name, err, tc.wantErr)
+				}
+				assertNoDEKReturned(t, "GenerateDEK("+tc.name+")", dek)
+				if len(wrapped.Ciphertext) != 0 {
+					t.Fatalf("GenerateDEK(%s) returned a record despite failing", tc.name)
+				}
+			})
+		}
+	})
+
 	t.Run("DistinctKeyIDsUnderOneKEKAreIndependent", func(t *testing.T) {
 		km := newKM(t)
 		ctx := context.Background()
@@ -331,6 +488,264 @@ func RunKeyManagerSuite(t *testing.T, newKM func(t *testing.T) keyring.KeyManage
 		t.Cleanup(final.Destroy)
 		if !bytes.Equal(final.Bytes(), material) {
 			t.Fatal("re-wrapping changed the DEK, which would have required re-encrypting the content")
+		}
+	})
+
+	// RewrapDEKMovesARecordToTheLatestKEKVersion is what makes CAS design
+	// §8.3's "KEK rotation is lazy re-wrapping rather than re-encrypting
+	// content" an operation this port actually offers. The previous subtest
+	// proves the unwrap-then-wrap version of it is possible; this one proves
+	// the port has a first-class method for it, which is the only form a key
+	// manager can perform without the DEK leaving the key store.
+	t.Run("RewrapDEKMovesARecordToTheLatestKEKVersion", func(t *testing.T) {
+		km := newKM(t)
+		ctx := context.Background()
+		kekID, keyID := newKEKID(t), newKeyID(t)
+
+		dek := newDEK(t)
+		material := bytes.Clone(dek.Bytes())
+		v1Record, err := km.WrapDEK(ctx, kekID, keyID, dek)
+		if err != nil {
+			t.Fatalf("WrapDEK: %v", err)
+		}
+
+		v2, err := km.RotateKEK(ctx, kekID)
+		if err != nil {
+			t.Fatalf("RotateKEK: %v", err)
+		}
+		if v2 <= v1Record.KEKVersion {
+			t.Fatalf("RotateKEK returned %s, want greater than %s", v2, v1Record.KEKVersion)
+		}
+
+		v2Record, err := km.RewrapDEK(ctx, v1Record)
+		if err != nil {
+			t.Fatalf("RewrapDEK: %v", err)
+		}
+		if err := v2Record.Validate(); err != nil {
+			t.Fatalf("RewrapDEK returned a record that does not validate: %v", err)
+		}
+		if v2Record.KEKVersion != v2 {
+			t.Errorf("RewrapDEK recorded %s, want the KEK's current version %s", v2Record.KEKVersion, v2)
+		}
+		if v2Record.KEKID != kekID || v2Record.KeyID != keyID {
+			t.Errorf("RewrapDEK returned kek=%q key=%q, want kek=%q key=%q",
+				v2Record.KEKID, v2Record.KeyID, kekID, keyID)
+		}
+		if bytes.Equal(v2Record.Ciphertext, v1Record.Ciphertext) {
+			t.Error("RewrapDEK returned the input ciphertext unchanged; nothing was re-wrapped")
+		}
+
+		// The point of the whole exercise: the DEK is the same one, so the
+		// content it encrypted is not re-encrypted.
+		got, err := km.UnwrapDEK(ctx, v2Record)
+		if err != nil {
+			t.Fatalf("UnwrapDEK of the rewrapped record: %v", err)
+		}
+		t.Cleanup(got.Destroy)
+		if !bytes.Equal(got.Bytes(), material) {
+			t.Fatal("the rewrapped record unwrapped to different key material; re-wrapping must not change the DEK")
+		}
+
+		// Re-wrapping is a new record, not a destructive migration: the old
+		// one is still on disk and still opens, so a caller can write the new
+		// record and only then forget the old one.
+		stillOld, err := km.UnwrapDEK(ctx, v1Record)
+		if err != nil {
+			t.Fatalf("UnwrapDEK of the original record after RewrapDEK: %v", err)
+		}
+		t.Cleanup(stillOld.Destroy)
+		if !bytes.Equal(stillOld.Bytes(), material) {
+			t.Fatal("RewrapDEK invalidated the record it was given")
+		}
+
+		// A record already at the latest version is re-wrapped, not rejected:
+		// a lazy rotation job walks records it cannot cheaply filter, and the
+		// second pass over one must converge rather than error.
+		again, err := km.RewrapDEK(ctx, v2Record)
+		if err != nil {
+			t.Fatalf("RewrapDEK of a record already at the current version: %v", err)
+		}
+		if again.KEKVersion != v2 {
+			t.Errorf("RewrapDEK at the current version recorded %s, want %s", again.KEKVersion, v2)
+		}
+		final, err := km.UnwrapDEK(ctx, again)
+		if err != nil {
+			t.Fatalf("UnwrapDEK of the twice-rewrapped record: %v", err)
+		}
+		t.Cleanup(final.Destroy)
+		if !bytes.Equal(final.Bytes(), material) {
+			t.Fatal("re-wrapping twice changed the DEK")
+		}
+	})
+
+	// RewrapDEKNeverYieldsPlaintext is the security invariant that is the
+	// reason RewrapDEK is a port method at all rather than sugar for
+	// unwrap-then-wrap. OpenBao transit's rewrap endpoint never returns
+	// plaintext, which is what makes it safe to hand a lazy rotation job a
+	// token that can rewrap but not decrypt; a port method that was defined as
+	// unwrap-then-wrap would throw that away, and an adapter implemented that
+	// way cannot be told apart from a correct one except by the properties
+	// asserted here and — for the transit adapter, which is the one where it
+	// matters — by that adapter's own test that no response body on the path
+	// contains the DEK.
+	t.Run("RewrapDEKNeverYieldsPlaintext", func(t *testing.T) {
+		km := newKM(t)
+		ctx := context.Background()
+		kekID, keyID := newKEKID(t), newKeyID(t)
+
+		dek := newDEK(t)
+		material := bytes.Clone(dek.Bytes())
+		record, err := km.WrapDEK(ctx, kekID, keyID, dek)
+		if err != nil {
+			t.Fatalf("WrapDEK: %v", err)
+		}
+
+		destroyedKEK := newKEKID(t)
+		if _, err := km.WrapDEK(ctx, destroyedKEK, keyID, dek); err != nil {
+			t.Fatalf("WrapDEK under the KEK about to be destroyed: %v", err)
+		}
+		shredded := relabel(record, func(w *keyring.WrappedDEK) { w.KEKID = destroyedKEK })
+		if err := km.DestroyKEK(ctx, destroyedKEK); err != nil {
+			t.Fatalf("DestroyKEK: %v", err)
+		}
+
+		// Every path through RewrapDEK, successful or not: the DEK must not
+		// appear in the record it returns, in the error it returns, or in any
+		// rendering of either. RewrapDEK's signature is the structural half of
+		// the invariant — there is no DEK in it to return — and these
+		// assertions are the half a wrong implementation could still fail.
+		paths := []struct {
+			name string
+			call func() (keyring.WrappedDEK, error)
+		}{
+			{"latest_version", func() (keyring.WrappedDEK, error) { return km.RewrapDEK(ctx, record) }},
+			{"after_rotation", func() (keyring.WrappedDEK, error) {
+				if _, err := km.RotateKEK(ctx, kekID); err != nil {
+					return keyring.WrappedDEK{}, err
+				}
+				return km.RewrapDEK(ctx, record)
+			}},
+			{"unknown_kek", func() (keyring.WrappedDEK, error) {
+				return km.RewrapDEK(ctx, relabel(record, func(w *keyring.WrappedDEK) { w.KEKID = newKEKID(t) }))
+			}},
+			{"destroyed_kek", func() (keyring.WrappedDEK, error) { return km.RewrapDEK(ctx, shredded) }},
+			{"tampered_ciphertext", func() (keyring.WrappedDEK, error) {
+				return km.RewrapDEK(ctx, relabel(record, func(w *keyring.WrappedDEK) { w.Ciphertext[0] ^= 0xFF }))
+			}},
+			{"moved_key_id", func() (keyring.WrappedDEK, error) {
+				return km.RewrapDEK(ctx, relabel(record, func(w *keyring.WrappedDEK) { w.KeyID = newKeyID(t) }))
+			}},
+			{"empty_ciphertext", func() (keyring.WrappedDEK, error) {
+				return km.RewrapDEK(ctx, relabel(record, func(w *keyring.WrappedDEK) { w.Ciphertext = nil }))
+			}},
+		}
+		for _, path := range paths {
+			t.Run(path.name, func(t *testing.T) {
+				rewrapped, err := path.call()
+				assertNoKeyMaterial(t, "RewrapDEK("+path.name+") ciphertext", string(rewrapped.Ciphertext), material)
+				assertNoKeyMaterial(t, "RewrapDEK("+path.name+") record rendering", rewrapped.String(), material)
+				if err == nil {
+					return
+				}
+				for label, rendering := range map[string]string{
+					"Error()": err.Error(),
+					"%v":      fmt.Sprintf("%v", err),
+					"%+v":     fmt.Sprintf("%+v", err),
+					"%s":      fmt.Sprintf("%s", err),
+				} {
+					assertNoKeyMaterial(t, "RewrapDEK("+path.name+") error rendered with "+label, rendering, material)
+				}
+			})
+		}
+	})
+
+	t.Run("RewrapDEKFailsClosed", func(t *testing.T) {
+		km := newKM(t)
+		ctx := context.Background()
+		kekID, keyID := newKEKID(t), newKeyID(t)
+
+		dek := newDEK(t)
+		record, err := km.WrapDEK(ctx, kekID, keyID, dek)
+		if err != nil {
+			t.Fatalf("WrapDEK: %v", err)
+		}
+		rotated, err := km.RotateKEK(ctx, kekID)
+		if err != nil {
+			t.Fatalf("RotateKEK: %v", err)
+		}
+
+		destroyedKEK := newKEKID(t)
+		if _, err := km.WrapDEK(ctx, destroyedKEK, keyID, dek); err != nil {
+			t.Fatalf("WrapDEK under the KEK about to be destroyed: %v", err)
+		}
+		if err := km.DestroyKEK(ctx, destroyedKEK); err != nil {
+			t.Fatalf("DestroyKEK: %v", err)
+		}
+
+		cases := []struct {
+			name     string
+			mutate   func(w *keyring.WrappedDEK)
+			wantErrs []error
+		}{
+			{"empty_kek_id", func(w *keyring.WrappedDEK) { w.KEKID = "" }, []error{keyring.ErrInvalidIdentifier}},
+			{"empty_key_id", func(w *keyring.WrappedDEK) { w.KeyID = "" }, []error{keyring.ErrInvalidIdentifier}},
+			{"zero_kek_version", func(w *keyring.WrappedDEK) { w.KEKVersion = 0 }, []error{keyring.ErrInvalidIdentifier}},
+			{"nil_ciphertext", func(w *keyring.WrappedDEK) { w.Ciphertext = nil }, []error{keyring.ErrInvalidWrappedDEK}},
+			{
+				// Rotation is not creation and neither is re-wrapping: a
+				// record naming a KEK that was never created has nothing to be
+				// re-wrapped under, and minting a KEK here would produce a
+				// record that looks migrated and opens to nothing.
+				"unknown_kek",
+				func(w *keyring.WrappedDEK) { w.KEKID = newKEKID(t) },
+				[]error{keyring.ErrKEKNotFound},
+			},
+			{
+				"destroyed_kek",
+				func(w *keyring.WrappedDEK) { w.KEKID = destroyedKEK },
+				[]error{keyring.ErrKEKDestroyed},
+			},
+			{
+				"wrong_kek_version",
+				func(w *keyring.WrappedDEK) { w.KEKVersion = rotated },
+				[]error{keyring.ErrUnwrapFailed},
+			},
+			{
+				"kek_version_that_never_existed",
+				func(w *keyring.WrappedDEK) { w.KEKVersion = rotated + 1000 },
+				[]error{keyring.ErrKEKNotFound, keyring.ErrUnwrapFailed},
+			},
+			{
+				"moved_key_id",
+				func(w *keyring.WrappedDEK) { w.KeyID = newKeyID(t) },
+				[]error{keyring.ErrUnwrapFailed},
+			},
+			{
+				"flipped_ciphertext_bit",
+				func(w *keyring.WrappedDEK) { w.Ciphertext[len(w.Ciphertext)-1] ^= 0x01 },
+				[]error{keyring.ErrUnwrapFailed},
+			},
+			{
+				"truncated_ciphertext",
+				func(w *keyring.WrappedDEK) { w.Ciphertext = w.Ciphertext[:len(w.Ciphertext)-1] },
+				[]error{keyring.ErrUnwrapFailed},
+			},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				got, err := km.RewrapDEK(ctx, relabel(record, tc.mutate))
+				if !errorIsAny(err, tc.wantErrs) {
+					t.Fatalf("RewrapDEK(%s) error = %v, want one of %v", tc.name, err, tc.wantErrs)
+				}
+				if len(got.Ciphertext) != 0 {
+					t.Fatalf("RewrapDEK(%s) returned a record despite failing", tc.name)
+				}
+			})
+		}
+
+		// None of the failures above may have disturbed the real record.
+		if _, err := km.RewrapDEK(ctx, record); err != nil {
+			t.Fatalf("RewrapDEK of the untouched record after the forgery attempts: %v", err)
 		}
 	})
 
@@ -589,6 +1004,30 @@ func RunKeyManagerSuite(t *testing.T, newKM func(t *testing.T) keyring.KeyManage
 				}))
 				return err
 			}},
+			{"generate_under_destroyed_kek", func() error {
+				_, _, err := km.GenerateDEK(ctx, destroyedKEK, keyID)
+				return err
+			}},
+			{"generate_with_invalid_key_id", func() error {
+				_, _, err := km.GenerateDEK(ctx, kekID, keyring.KeyID("bad/key\x00id"))
+				return err
+			}},
+			{"rewrap_tampered_ciphertext", func() error {
+				_, err := km.RewrapDEK(ctx, relabel(wrapped, func(w *keyring.WrappedDEK) {
+					w.Ciphertext[0] ^= 0xFF
+				}))
+				return err
+			}},
+			{"rewrap_under_destroyed_kek", func() error {
+				_, err := km.RewrapDEK(ctx, shredded)
+				return err
+			}},
+			{"rewrap_unknown_kek", func() error {
+				_, err := km.RewrapDEK(ctx, relabel(wrapped, func(w *keyring.WrappedDEK) {
+					w.KEKID = newKEKID(t)
+				}))
+				return err
+			}},
 		}
 		for _, failure := range failures {
 			t.Run(failure.name, func(t *testing.T) {
@@ -717,6 +1156,14 @@ func RunKeyManagerSuite(t *testing.T, newKM func(t *testing.T) keyring.KeyManage
 		if err := km.DestroyKEK(ctx, kekID); !errors.Is(err, context.Canceled) {
 			t.Errorf("DestroyKEK with a cancelled context: error = %v, want context.Canceled", err)
 		}
+		if dek, _, err := km.GenerateDEK(ctx, kekID, keyID); !errors.Is(err, context.Canceled) {
+			t.Errorf("GenerateDEK with a cancelled context: error = %v, want context.Canceled", err)
+		} else {
+			assertNoDEKReturned(t, "GenerateDEK with a cancelled context", dek)
+		}
+		if _, err := km.RewrapDEK(ctx, wrapped); !errors.Is(err, context.Canceled) {
+			t.Errorf("RewrapDEK with a cancelled context: error = %v, want context.Canceled", err)
+		}
 	})
 
 	t.Run("ConcurrentWrapAndUnwrapAreSafe", func(t *testing.T) {
@@ -726,12 +1173,17 @@ func RunKeyManagerSuite(t *testing.T, newKM func(t *testing.T) keyring.KeyManage
 
 		const goroutines = 8
 		var wg sync.WaitGroup
-		errs := make([]error, goroutines)
+		errs := make([]error, 2*goroutines)
 		for i := range goroutines {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
 				errs[i] = wrapUnwrapOnce(ctx, km, kekID, keyring.KeyID(fmt.Sprintf("concurrent-%d", i)))
+			}()
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				errs[goroutines+i] = generateRewrapUnwrapOnce(ctx, km, kekID, keyring.KeyID(fmt.Sprintf("concurrent-generated-%d", i)))
 			}()
 		}
 		// A rotation in flight: wraps that land either side of it record
@@ -775,6 +1227,33 @@ func wrapUnwrapOnce(ctx context.Context, km keyring.KeyManager, kekID keyring.KE
 	defer got.Destroy()
 	if !bytes.Equal(got.Bytes(), material) {
 		return errors.New("unwrapped DEK does not match the wrapped one")
+	}
+	return nil
+}
+
+// generateRewrapUnwrapOnce drives the two new methods end to end —
+// GenerateDEK, RewrapDEK, UnwrapDEK — and checks that the key survives the
+// round trip. Like wrapUnwrapOnce it returns an error rather than failing a
+// *testing.T, so it is safe to call from a goroutine.
+func generateRewrapUnwrapOnce(ctx context.Context, km keyring.KeyManager, kekID keyring.KEKID, keyID keyring.KeyID) error {
+	dek, record, err := km.GenerateDEK(ctx, kekID, keyID)
+	if err != nil {
+		return fmt.Errorf("GenerateDEK: %w", err)
+	}
+	defer dek.Destroy()
+	material := bytes.Clone(dek.Bytes())
+
+	rewrapped, err := km.RewrapDEK(ctx, record)
+	if err != nil {
+		return fmt.Errorf("RewrapDEK: %w", err)
+	}
+	got, err := km.UnwrapDEK(ctx, rewrapped)
+	if err != nil {
+		return fmt.Errorf("UnwrapDEK of the rewrapped record: %w", err)
+	}
+	defer got.Destroy()
+	if !bytes.Equal(got.Bytes(), material) {
+		return errors.New("the rewrapped record unwrapped to different key material than was generated")
 	}
 	return nil
 }

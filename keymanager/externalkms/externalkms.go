@@ -75,9 +75,19 @@ func (k *KeyManager) WrapDEK(_ context.Context, _ domain.KEKID, _ domain.KeyID, 
 	return domain.WrappedDEK{}, fmt.Errorf("%w: external-kms WrapDEK", domain.ErrNotImplemented)
 }
 
+// GenerateDEK implements keymanager.KeyManager.
+func (k *KeyManager) GenerateDEK(_ context.Context, _ domain.KEKID, _ domain.KeyID) (domain.DEK, domain.WrappedDEK, error) {
+	return domain.DEK{}, domain.WrappedDEK{}, fmt.Errorf("%w: external-kms GenerateDEK", domain.ErrNotImplemented)
+}
+
 // UnwrapDEK implements keymanager.KeyManager.
 func (k *KeyManager) UnwrapDEK(_ context.Context, _ domain.WrappedDEK) (domain.DEK, error) {
 	return domain.DEK{}, fmt.Errorf("%w: external-kms UnwrapDEK", domain.ErrNotImplemented)
+}
+
+// RewrapDEK implements keymanager.KeyManager.
+func (k *KeyManager) RewrapDEK(_ context.Context, _ domain.WrappedDEK) (domain.WrappedDEK, error) {
+	return domain.WrappedDEK{}, fmt.Errorf("%w: external-kms RewrapDEK", domain.ErrNotImplemented)
 }
 
 // RotateKEK implements keymanager.KeyManager.

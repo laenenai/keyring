@@ -80,6 +80,31 @@ type KeyManager interface {
 	// dek.Destroy.
 	WrapDEK(ctx context.Context, kekID domain.KEKID, keyID domain.KeyID, dek domain.DEK) (domain.WrappedDEK, error)
 
+	// GenerateDEK mints a fresh DEK and returns it together with its wrapped
+	// form, under the current version of the KEK named by kekID and bound to
+	// keyID exactly as WrapDEK would. The caller owns the returned DEK and
+	// must Destroy it.
+	//
+	// It exists because the key manager is the better place to mint a DEK
+	// than its caller. OpenBao transit has one endpoint for this
+	// (datakey/plaintext): the DEK is generated *inside* the key store, from
+	// the key store's entropy, and the plaintext and the ciphertext come back
+	// in a single round trip. A caller doing crypto/rand plus WrapDEK instead
+	// gets its DEKs from whatever entropy its own process has, and puts the
+	// two halves of one operation in two places where only one of them can
+	// fail. An adapter with no such endpoint — the local one — generates
+	// locally and is indistinguishable here, which is the point of having the
+	// method on the port rather than on one adapter.
+	//
+	// Semantics otherwise match WrapDEK's exactly, including implicit
+	// creation of a KEK that does not exist yet and ErrKEKDestroyed for one
+	// that has been destroyed: a shredded KEK must not be resurrected through
+	// a second door.
+	//
+	// On any error the returned DEK holds no key material and the returned
+	// record carries no ciphertext.
+	GenerateDEK(ctx context.Context, kekID domain.KEKID, keyID domain.KeyID) (domain.DEK, domain.WrappedDEK, error)
+
 	// UnwrapDEK decrypts wrapped and returns the DEK it carries. The caller
 	// owns the returned DEK and must Destroy it; two unwraps of the same
 	// record return two independently-owned DEKs, so destroying one never
@@ -109,6 +134,38 @@ type KeyManager interface {
 	//     record claims and fail here on a mismatch.
 	// On any error the returned DEK holds no key material.
 	UnwrapDEK(ctx context.Context, wrapped domain.WrappedDEK) (domain.DEK, error)
+
+	// RewrapDEK re-encrypts wrapped under the current version of the KEK it
+	// names and returns the new record, without ever returning the DEK it
+	// carries. The DEK is unchanged, so the content it encrypted is not
+	// re-encrypted: this is CAS design §8.3's "KEK rotation is lazy
+	// re-wrapping rather than re-encrypting content", as one operation.
+	//
+	// It is a first-class method and MUST NOT be implemented as unwrap
+	// followed by wrap, because the difference is the whole reason it exists.
+	// OpenBao transit's rewrap endpoint documents that plaintext is never
+	// returned, which is what makes it safe to delegate a rotation sweep to
+	// something that is not trusted to read the keys it is migrating: the job
+	// needs the rewrap capability and not the decrypt one, and the DEK never
+	// enters the process running the sweep. An adapter that unwrapped and
+	// wrapped again would satisfy every functional assertion and quietly
+	// discard that property. Where an adapter has no such primitive — the
+	// local one, whose KEK material is in this process either way — its doc
+	// comment says so, because the guarantee is then only as strong as the
+	// adapter.
+	//
+	// Re-wrapping is additive: the record passed in is untouched and still
+	// unwraps, so a caller writes the new record and only then forgets the
+	// old one. A record already at the KEK's current version is re-wrapped
+	// rather than rejected, so a sweep that cannot cheaply tell which records
+	// are current converges instead of erroring.
+	//
+	// It returns the same errors UnwrapDEK does, for the same reasons:
+	// ErrKEKDestroyed, ErrKEKNotFound (re-wrapping is not creation, so a KEK
+	// that never existed is not minted here either), and ErrUnwrapFailed for
+	// a record that does not authenticate under the KEK and version it names.
+	// On any error the returned record carries no ciphertext.
+	RewrapDEK(ctx context.Context, wrapped domain.WrappedDEK) (domain.WrappedDEK, error)
 
 	// RotateKEK creates the next version of the KEK named by kekID and
 	// returns it. Subsequent WrapDEK calls use the new version; every

@@ -73,7 +73,9 @@ func NewDEK() (DEK, error)
 # github.com/laenen-ai/keyring/keymanager
 type KeyManager interface {
 	WrapDEK(ctx context.Context, kekID domain.KEKID, keyID domain.KeyID, dek domain.DEK) (domain.WrappedDEK, error)
+	GenerateDEK(ctx context.Context, kekID domain.KEKID, keyID domain.KeyID) (domain.DEK, domain.WrappedDEK, error)
 	UnwrapDEK(ctx context.Context, wrapped domain.WrappedDEK) (domain.DEK, error)
+	RewrapDEK(ctx context.Context, wrapped domain.WrappedDEK) (domain.WrappedDEK, error)
 	RotateKEK(ctx context.Context, kekID domain.KEKID) (domain.KEKVersion, error)
 	DestroyKEK(ctx context.Context, kekID domain.KEKID) error
 }
@@ -85,6 +87,8 @@ type Config struct {
 }
 type KeyManager struct {}
 func (k *KeyManager) DestroyKEK(_ context.Context, _ domain.KEKID) error
+func (k *KeyManager) GenerateDEK(_ context.Context, _ domain.KEKID, _ domain.KeyID) (domain.DEK, domain.WrappedDEK, error)
+func (k *KeyManager) RewrapDEK(_ context.Context, _ domain.WrappedDEK) (domain.WrappedDEK, error)
 func (k *KeyManager) RotateKEK(_ context.Context, _ domain.KEKID) (domain.KEKVersion, error)
 func (k *KeyManager) UnwrapDEK(_ context.Context, _ domain.WrappedDEK) (domain.DEK, error)
 func (k *KeyManager) WrapDEK(_ context.Context, _ domain.KEKID, _ domain.KeyID, _ domain.DEK) (domain.WrappedDEK, error)
@@ -112,6 +116,8 @@ type MemKEKStore struct {
 	// has unexported fields
 }
 func (k *KeyManager) DestroyKEK(ctx context.Context, kekID domain.KEKID) error
+func (k *KeyManager) GenerateDEK(ctx context.Context, kekID domain.KEKID, keyID domain.KeyID) (domain.DEK, domain.WrappedDEK, error)
+func (k *KeyManager) RewrapDEK(ctx context.Context, wrapped domain.WrappedDEK) (domain.WrappedDEK, error)
 func (k *KeyManager) RotateKEK(ctx context.Context, kekID domain.KEKID) (domain.KEKVersion, error)
 func (k *KeyManager) UnwrapDEK(ctx context.Context, wrapped domain.WrappedDEK) (domain.DEK, error)
 func (k *KeyManager) WrapDEK(ctx context.Context, kekID domain.KEKID, keyID domain.KeyID, dek domain.DEK) (domain.WrappedDEK, error)
@@ -130,6 +136,8 @@ type Config struct {
 }
 type KeyManager struct {}
 func (k *KeyManager) DestroyKEK(_ context.Context, _ domain.KEKID) error
+func (k *KeyManager) GenerateDEK(_ context.Context, _ domain.KEKID, _ domain.KeyID) (domain.DEK, domain.WrappedDEK, error)
+func (k *KeyManager) RewrapDEK(_ context.Context, _ domain.WrappedDEK) (domain.WrappedDEK, error)
 func (k *KeyManager) RotateKEK(_ context.Context, _ domain.KEKID) (domain.KEKVersion, error)
 func (k *KeyManager) UnwrapDEK(_ context.Context, _ domain.WrappedDEK) (domain.DEK, error)
 func (k *KeyManager) WrapDEK(_ context.Context, _ domain.KEKID, _ domain.KeyID, _ domain.DEK) (domain.WrappedDEK, error)
