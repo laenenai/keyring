@@ -194,11 +194,16 @@ func TestDEKNeverRendersItsMaterial(t *testing.T) {
 		DEK  domain.DEK
 	}
 
+	// The verbs are variables rather than literals so that a linter which
+	// rewrites fmt.Sprintf("%s", x) into x.String() cannot quietly remove
+	// the thing under test, which is the fmt path itself.
+	vVerb, sVerb := "%v", "%s"
+
 	renderings := map[string]string{
 		"String":            dek.String(),
 		"GoString":          dek.GoString(),
-		"fmt %v":            fmt.Sprintf("%v", dek),
-		"fmt %s":            fmt.Sprintf("%s", dek),
+		"fmt %v":            fmt.Sprintf(vVerb, dek),
+		"fmt %s":            fmt.Sprintf(sVerb, dek),
 		"fmt %+v":           fmt.Sprintf("%+v", dek),
 		"fmt %#v":           fmt.Sprintf("%#v", dek),
 		"fmt %v pointer":    fmt.Sprintf("%v", &dek),
