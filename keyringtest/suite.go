@@ -1,4 +1,28 @@
-package keymanager
+// Package keyringtest is the conformance suite for the keyring module: the
+// authoritative, executable description of what a keyring.KeyManager must
+// do. The interface in keymanager says what the operations are called;
+// RunKeyManagerSuite here says what they mean, including every edge the
+// interface cannot state — what fails closed, what is idempotent, which
+// errors are deliberately uninformative, and what a destroyed KEK does to
+// the DEKs wrapped under it.
+//
+// It is a sibling package rather than a suite.go inside keymanager for two
+// reasons, both forced (see CONVENTIONS.md). Identifiers in _test.go files
+// are not importable from another module, and CHARTER.md defines adoption as
+// this suite running green in a consumer's own CI against the consumer's own
+// wiring — so the suite cannot be test-only. But a non-test file that
+// imports testing would put testing in the production import graph of every
+// consumer that imports the port, so it cannot live beside the port either.
+// httptest is to http what this package is to keyring.
+//
+// An adapter's own test file is one function long:
+//
+//	func TestMyKeyManagerConformance(t *testing.T) {
+//		keyringtest.RunKeyManagerSuite(t, func(t *testing.T) keyring.KeyManager {
+//			return myAdapter(t)
+//		})
+//	}
+package keyringtest
 
 import (
 	"bytes"
@@ -12,7 +36,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/laenen-ai/keyring/internal/domain"
+	"github.com/laenen-ai/keyring"
 )
 
 // RunKeyManagerSuite runs the contract every KeyManager adapter must
@@ -26,13 +50,6 @@ import (
 // shared across subtests — a single OpenBao instance, one KMS account —
 // never has two subtests collide on the same key.
 //
-// This file is deliberately not named suite_test.go: RunKeyManagerSuite must
-// be importable from another package's, and another module's, adapter tests.
-// CHARTER.md defines a consumer as having adopted this module when this
-// suite runs green in that consumer's CI against its own wiring, which only
-// works for a regular, non-test-only source file in a non-internal package.
-// This mirrors the standard library's testing/fstest.TestFS.
-//
 // Every assertion here must hold for any key manager — an in-process AES-GCM
 // wrapper, OpenBao's transit engine, AWS KMS, a tenant's HSM. Nothing here
 // inspects an adapter's wire format, its storage, or its key derivation.
@@ -41,7 +58,7 @@ import (
 // ciphertext (a fresh nonce per wrap) is tested in local/local_test.go
 // precisely because a deterministic scheme such as RFC 3394 AES-KW would be
 // a legitimate adapter that this suite must not reject.
-func RunKeyManagerSuite(t *testing.T, newKM func(t *testing.T) KeyManager) {
+func RunKeyManagerSuite(t *testing.T, newKM func(t *testing.T) keyring.KeyManager) {
 	t.Helper()
 
 	t.Run("WrapUnwrapRoundTrip", func(t *testing.T) {
@@ -65,8 +82,8 @@ func RunKeyManagerSuite(t *testing.T, newKM func(t *testing.T) KeyManager) {
 		if wrapped.KeyID != keyID {
 			t.Errorf("wrapped.KeyID = %q, want %q", wrapped.KeyID, keyID)
 		}
-		if wrapped.KEKVersion < domain.FirstKEKVersion {
-			t.Errorf("wrapped.KEKVersion = %s, want at least %s", wrapped.KEKVersion, domain.FirstKEKVersion)
+		if wrapped.KEKVersion < keyring.FirstKEKVersion {
+			t.Errorf("wrapped.KEKVersion = %s, want at least %s", wrapped.KEKVersion, keyring.FirstKEKVersion)
 		}
 
 		// The one thing a "wrapped" DEK must never be is the DEK. An
@@ -142,7 +159,7 @@ func RunKeyManagerSuite(t *testing.T, newKM func(t *testing.T) KeyManager) {
 		kekID := newKEKID(t)
 
 		type record struct {
-			wrapped  domain.WrappedDEK
+			wrapped  keyring.WrappedDEK
 			material []byte
 		}
 		records := make([]record, 0, 3)
@@ -183,9 +200,9 @@ func RunKeyManagerSuite(t *testing.T, newKM func(t *testing.T) KeyManager) {
 		// so, rather than reporting a generic failure a caller cannot act
 		// on (a missing KEK is an operational fault; a failed unwrap is a
 		// trust fault).
-		unknown := relabel(wrapped, func(w *domain.WrappedDEK) { w.KEKID = newKEKID(t) })
+		unknown := relabel(wrapped, func(w *keyring.WrappedDEK) { w.KEKID = newKEKID(t) })
 		got, err := km.UnwrapDEK(ctx, unknown)
-		if !errors.Is(err, domain.ErrKEKNotFound) {
+		if !errors.Is(err, keyring.ErrKEKNotFound) {
 			t.Fatalf("UnwrapDEK(unknown KEK) error = %v, want ErrKEKNotFound", err)
 		}
 		assertNoDEKReturned(t, "UnwrapDEK(unknown KEK)", got)
@@ -195,7 +212,7 @@ func RunKeyManagerSuite(t *testing.T, newKM func(t *testing.T) KeyManager) {
 		km := newKM(t)
 		ctx := context.Background()
 
-		if _, err := km.RotateKEK(ctx, newKEKID(t)); !errors.Is(err, domain.ErrKEKNotFound) {
+		if _, err := km.RotateKEK(ctx, newKEKID(t)); !errors.Is(err, keyring.ErrKEKNotFound) {
 			t.Fatalf("RotateKEK(unknown KEK) error = %v, want ErrKEKNotFound (rotation is not creation)", err)
 		}
 	})
@@ -206,7 +223,7 @@ func RunKeyManagerSuite(t *testing.T, newKM func(t *testing.T) KeyManager) {
 
 		// An erasure certificate records which keys were destroyed, so
 		// "destroy a KEK that never existed" must not report success.
-		if err := km.DestroyKEK(ctx, newKEKID(t)); !errors.Is(err, domain.ErrKEKNotFound) {
+		if err := km.DestroyKEK(ctx, newKEKID(t)); !errors.Is(err, keyring.ErrKEKNotFound) {
 			t.Fatalf("DestroyKEK(unknown KEK) error = %v, want ErrKEKNotFound", err)
 		}
 	})
@@ -345,20 +362,20 @@ func RunKeyManagerSuite(t *testing.T, newKM func(t *testing.T) KeyManager) {
 
 		cases := []struct {
 			name   string
-			mutate func(w *domain.WrappedDEK)
+			mutate func(w *keyring.WrappedDEK)
 			// wantErrs lists the acceptable sentinels; more than one is
 			// allowed only where two correct adapters genuinely differ.
 			wantErrs []error
 		}{
 			{
 				name:     "different_existing_kek",
-				mutate:   func(w *domain.WrappedDEK) { w.KEKID = kekB },
-				wantErrs: []error{domain.ErrUnwrapFailed},
+				mutate:   func(w *keyring.WrappedDEK) { w.KEKID = kekB },
+				wantErrs: []error{keyring.ErrUnwrapFailed},
 			},
 			{
 				name:     "existing_but_wrong_kek_version",
-				mutate:   func(w *domain.WrappedDEK) { w.KEKVersion = rotatedA },
-				wantErrs: []error{domain.ErrUnwrapFailed},
+				mutate:   func(w *keyring.WrappedDEK) { w.KEKVersion = rotatedA },
+				wantErrs: []error{keyring.ErrUnwrapFailed},
 			},
 			{
 				// An adapter that resolves key material by version reports
@@ -366,41 +383,41 @@ func RunKeyManagerSuite(t *testing.T, newKM func(t *testing.T) KeyManager) {
 				// out of the ciphertext reports the mismatch. Both fail
 				// closed, which is the property under test.
 				name:     "kek_version_that_never_existed",
-				mutate:   func(w *domain.WrappedDEK) { w.KEKVersion = rotatedA + 1000 },
-				wantErrs: []error{domain.ErrKEKNotFound, domain.ErrUnwrapFailed},
+				mutate:   func(w *keyring.WrappedDEK) { w.KEKVersion = rotatedA + 1000 },
+				wantErrs: []error{keyring.ErrKEKNotFound, keyring.ErrUnwrapFailed},
 			},
 			{
 				name:     "record_moved_to_a_different_key_id",
-				mutate:   func(w *domain.WrappedDEK) { w.KeyID = newKeyID(t) },
-				wantErrs: []error{domain.ErrUnwrapFailed},
+				mutate:   func(w *keyring.WrappedDEK) { w.KeyID = newKeyID(t) },
+				wantErrs: []error{keyring.ErrUnwrapFailed},
 			},
 			{
 				name: "flipped_ciphertext_bit",
-				mutate: func(w *domain.WrappedDEK) {
+				mutate: func(w *keyring.WrappedDEK) {
 					w.Ciphertext[len(w.Ciphertext)-1] ^= 0x01
 				},
-				wantErrs: []error{domain.ErrUnwrapFailed},
+				wantErrs: []error{keyring.ErrUnwrapFailed},
 			},
 			{
 				name: "flipped_first_ciphertext_bit",
-				mutate: func(w *domain.WrappedDEK) {
+				mutate: func(w *keyring.WrappedDEK) {
 					w.Ciphertext[0] ^= 0x80
 				},
-				wantErrs: []error{domain.ErrUnwrapFailed},
+				wantErrs: []error{keyring.ErrUnwrapFailed},
 			},
 			{
 				name: "truncated_ciphertext",
-				mutate: func(w *domain.WrappedDEK) {
+				mutate: func(w *keyring.WrappedDEK) {
 					w.Ciphertext = w.Ciphertext[:len(w.Ciphertext)-1]
 				},
-				wantErrs: []error{domain.ErrUnwrapFailed},
+				wantErrs: []error{keyring.ErrUnwrapFailed},
 			},
 			{
 				name: "appended_ciphertext",
-				mutate: func(w *domain.WrappedDEK) {
+				mutate: func(w *keyring.WrappedDEK) {
 					w.Ciphertext = append(w.Ciphertext, 0x00)
 				},
-				wantErrs: []error{domain.ErrUnwrapFailed},
+				wantErrs: []error{keyring.ErrUnwrapFailed},
 			},
 		}
 		for _, tc := range cases {
@@ -459,10 +476,10 @@ func RunKeyManagerSuite(t *testing.T, newKM func(t *testing.T) KeyManager) {
 		// Every version's records are gone, and stay gone however many
 		// times they are asked for: there is no retry, cache expiry or
 		// reconnect that brings them back.
-		for _, rec := range []domain.WrappedDEK{v1Record, v2Record} {
+		for _, rec := range []keyring.WrappedDEK{v1Record, v2Record} {
 			for attempt := range 3 {
 				got, err := km.UnwrapDEK(ctx, rec)
-				if !errors.Is(err, domain.ErrKEKDestroyed) {
+				if !errors.Is(err, keyring.ErrKEKDestroyed) {
 					t.Fatalf("UnwrapDEK(%s, attempt %d) error = %v, want ErrKEKDestroyed", rec.KEKVersion, attempt+1, err)
 				}
 				assertNoDEKReturned(t, "UnwrapDEK after DestroyKEK", got)
@@ -472,10 +489,10 @@ func RunKeyManagerSuite(t *testing.T, newKM func(t *testing.T) KeyManager) {
 		// A destroyed KEK is never resurrected under its own name: wrapping
 		// again would otherwise mint a fresh version 1 and leave a caller
 		// unable to tell a pre-shredding record from a post-shredding one.
-		if _, err := km.WrapDEK(ctx, doomed, newKeyID(t), dek); !errors.Is(err, domain.ErrKEKDestroyed) {
+		if _, err := km.WrapDEK(ctx, doomed, newKeyID(t), dek); !errors.Is(err, keyring.ErrKEKDestroyed) {
 			t.Fatalf("WrapDEK under a destroyed KEK error = %v, want ErrKEKDestroyed", err)
 		}
-		if _, err := km.RotateKEK(ctx, doomed); !errors.Is(err, domain.ErrKEKDestroyed) {
+		if _, err := km.RotateKEK(ctx, doomed); !errors.Is(err, keyring.ErrKEKDestroyed) {
 			t.Fatalf("RotateKEK of a destroyed KEK error = %v, want ErrKEKDestroyed", err)
 		}
 
@@ -504,7 +521,7 @@ func RunKeyManagerSuite(t *testing.T, newKM func(t *testing.T) KeyManager) {
 	// error — raw, hex (either case), or base64 (any alphabet).
 	//
 	// The "or logs" half of the invariant is held by the type rather than by
-	// this subtest, which cannot see an adapter's logger: domain.DEK renders
+	// this subtest, which cannot see an adapter's logger: keyring.DEK renders
 	// as [REDACTED] through fmt, encoding/json, encoding.TextMarshaler and
 	// slog alike (see internal/domain's TestDEKNeverRendersItsMaterial), so
 	// logging key material requires an adapter to deliberately reach for
@@ -526,7 +543,7 @@ func RunKeyManagerSuite(t *testing.T, newKM func(t *testing.T) KeyManager) {
 		if _, err := km.WrapDEK(ctx, destroyedKEK, keyID, dek); err != nil {
 			t.Fatalf("WrapDEK under the KEK about to be destroyed: %v", err)
 		}
-		shredded := relabel(wrapped, func(w *domain.WrappedDEK) { w.KEKID = destroyedKEK })
+		shredded := relabel(wrapped, func(w *keyring.WrappedDEK) { w.KEKID = destroyedKEK })
 		if err := km.DestroyKEK(ctx, destroyedKEK); err != nil {
 			t.Fatalf("DestroyKEK: %v", err)
 		}
@@ -547,17 +564,17 @@ func RunKeyManagerSuite(t *testing.T, newKM func(t *testing.T) KeyManager) {
 				return err
 			}},
 			{"wrap_with_invalid_key_id", func() error {
-				_, err := km.WrapDEK(ctx, kekID, domain.KeyID("bad/key\x00id"), dek)
+				_, err := km.WrapDEK(ctx, kekID, keyring.KeyID("bad/key\x00id"), dek)
 				return err
 			}},
 			{"unwrap_tampered_ciphertext", func() error {
-				_, err := km.UnwrapDEK(ctx, relabel(wrapped, func(w *domain.WrappedDEK) {
+				_, err := km.UnwrapDEK(ctx, relabel(wrapped, func(w *keyring.WrappedDEK) {
 					w.Ciphertext[0] ^= 0xFF
 				}))
 				return err
 			}},
 			{"unwrap_unknown_kek", func() error {
-				_, err := km.UnwrapDEK(ctx, relabel(wrapped, func(w *domain.WrappedDEK) {
+				_, err := km.UnwrapDEK(ctx, relabel(wrapped, func(w *keyring.WrappedDEK) {
 					w.KEKID = newKEKID(t)
 				}))
 				return err
@@ -567,7 +584,7 @@ func RunKeyManagerSuite(t *testing.T, newKM func(t *testing.T) KeyManager) {
 				return err
 			}},
 			{"unwrap_empty_ciphertext", func() error {
-				_, err := km.UnwrapDEK(ctx, relabel(wrapped, func(w *domain.WrappedDEK) {
+				_, err := km.UnwrapDEK(ctx, relabel(wrapped, func(w *keyring.WrappedDEK) {
 					w.Ciphertext = nil
 				}))
 				return err
@@ -609,18 +626,18 @@ func RunKeyManagerSuite(t *testing.T, newKM func(t *testing.T) KeyManager) {
 		t.Run("Wrap", func(t *testing.T) {
 			cases := []struct {
 				name    string
-				kekID   domain.KEKID
-				keyID   domain.KeyID
-				dek     domain.DEK
+				kekID   keyring.KEKID
+				keyID   keyring.KeyID
+				dek     keyring.DEK
 				wantErr error
 			}{
-				{"empty_kek_id", "", keyID, dek, domain.ErrInvalidIdentifier},
-				{"empty_key_id", kekID, "", dek, domain.ErrInvalidIdentifier},
-				{"kek_id_with_separator", "a/b", keyID, dek, domain.ErrInvalidIdentifier},
-				{"key_id_with_null_byte", kekID, domain.KeyID("a\x00b"), dek, domain.ErrInvalidIdentifier},
-				{"over_long_kek_id", domain.KEKID(overLong), keyID, dek, domain.ErrInvalidIdentifier},
-				{"zero_dek", kekID, keyID, domain.DEK{}, domain.ErrInvalidKeyMaterial},
-				{"destroyed_dek", kekID, keyID, zeroized, domain.ErrInvalidKeyMaterial},
+				{"empty_kek_id", "", keyID, dek, keyring.ErrInvalidIdentifier},
+				{"empty_key_id", kekID, "", dek, keyring.ErrInvalidIdentifier},
+				{"kek_id_with_separator", "a/b", keyID, dek, keyring.ErrInvalidIdentifier},
+				{"key_id_with_null_byte", kekID, keyring.KeyID("a\x00b"), dek, keyring.ErrInvalidIdentifier},
+				{"over_long_kek_id", keyring.KEKID(overLong), keyID, dek, keyring.ErrInvalidIdentifier},
+				{"zero_dek", kekID, keyID, keyring.DEK{}, keyring.ErrInvalidKeyMaterial},
+				{"destroyed_dek", kekID, keyID, zeroized, keyring.ErrInvalidKeyMaterial},
 			}
 			for _, tc := range cases {
 				t.Run(tc.name, func(t *testing.T) {
@@ -638,14 +655,14 @@ func RunKeyManagerSuite(t *testing.T, newKM func(t *testing.T) KeyManager) {
 		t.Run("Unwrap", func(t *testing.T) {
 			cases := []struct {
 				name    string
-				mutate  func(w *domain.WrappedDEK)
+				mutate  func(w *keyring.WrappedDEK)
 				wantErr error
 			}{
-				{"empty_kek_id", func(w *domain.WrappedDEK) { w.KEKID = "" }, domain.ErrInvalidIdentifier},
-				{"empty_key_id", func(w *domain.WrappedDEK) { w.KeyID = "" }, domain.ErrInvalidIdentifier},
-				{"zero_kek_version", func(w *domain.WrappedDEK) { w.KEKVersion = 0 }, domain.ErrInvalidIdentifier},
-				{"nil_ciphertext", func(w *domain.WrappedDEK) { w.Ciphertext = nil }, domain.ErrInvalidWrappedDEK},
-				{"empty_ciphertext", func(w *domain.WrappedDEK) { w.Ciphertext = []byte{} }, domain.ErrInvalidWrappedDEK},
+				{"empty_kek_id", func(w *keyring.WrappedDEK) { w.KEKID = "" }, keyring.ErrInvalidIdentifier},
+				{"empty_key_id", func(w *keyring.WrappedDEK) { w.KeyID = "" }, keyring.ErrInvalidIdentifier},
+				{"zero_kek_version", func(w *keyring.WrappedDEK) { w.KEKVersion = 0 }, keyring.ErrInvalidIdentifier},
+				{"nil_ciphertext", func(w *keyring.WrappedDEK) { w.Ciphertext = nil }, keyring.ErrInvalidWrappedDEK},
+				{"empty_ciphertext", func(w *keyring.WrappedDEK) { w.Ciphertext = []byte{} }, keyring.ErrInvalidWrappedDEK},
 			}
 			for _, tc := range cases {
 				t.Run(tc.name, func(t *testing.T) {
@@ -659,10 +676,10 @@ func RunKeyManagerSuite(t *testing.T, newKM func(t *testing.T) KeyManager) {
 		})
 
 		t.Run("RotateAndDestroy", func(t *testing.T) {
-			if _, err := km.RotateKEK(ctx, ""); !errors.Is(err, domain.ErrInvalidIdentifier) {
+			if _, err := km.RotateKEK(ctx, ""); !errors.Is(err, keyring.ErrInvalidIdentifier) {
 				t.Fatalf("RotateKEK(empty KEK id) error = %v, want ErrInvalidIdentifier", err)
 			}
-			if err := km.DestroyKEK(ctx, "a/b"); !errors.Is(err, domain.ErrInvalidIdentifier) {
+			if err := km.DestroyKEK(ctx, "a/b"); !errors.Is(err, keyring.ErrInvalidIdentifier) {
 				t.Fatalf("DestroyKEK(unsafe KEK id) error = %v, want ErrInvalidIdentifier", err)
 			}
 		})
@@ -714,7 +731,7 @@ func RunKeyManagerSuite(t *testing.T, newKM func(t *testing.T) KeyManager) {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				errs[i] = wrapUnwrapOnce(ctx, km, kekID, domain.KeyID(fmt.Sprintf("concurrent-%d", i)))
+				errs[i] = wrapUnwrapOnce(ctx, km, kekID, keyring.KeyID(fmt.Sprintf("concurrent-%d", i)))
 			}()
 		}
 		// A rotation in flight: wraps that land either side of it record
@@ -722,7 +739,7 @@ func RunKeyManagerSuite(t *testing.T, newKM func(t *testing.T) KeyManager) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if _, err := km.RotateKEK(ctx, kekID); err != nil && !errors.Is(err, domain.ErrKEKNotFound) {
+			if _, err := km.RotateKEK(ctx, kekID); err != nil && !errors.Is(err, keyring.ErrKEKNotFound) {
 				t.Errorf("concurrent RotateKEK: %v", err)
 			}
 		}()
@@ -739,8 +756,8 @@ func RunKeyManagerSuite(t *testing.T, newKM func(t *testing.T) KeyManager) {
 // wrapUnwrapOnce mints a DEK, wraps it, unwraps it and checks the round
 // trip, returning an error rather than failing a *testing.T so it is safe to
 // call from a goroutine.
-func wrapUnwrapOnce(ctx context.Context, km KeyManager, kekID domain.KEKID, keyID domain.KeyID) error {
-	dek, err := domain.NewDEK()
+func wrapUnwrapOnce(ctx context.Context, km keyring.KeyManager, kekID keyring.KEKID, keyID keyring.KeyID) error {
+	dek, err := keyring.NewDEK()
 	if err != nil {
 		return fmt.Errorf("NewDEK: %w", err)
 	}
@@ -764,7 +781,7 @@ func wrapUnwrapOnce(ctx context.Context, km KeyManager, kekID domain.KEKID, keyI
 
 // relabel returns a copy of w with mutate applied, cloning the ciphertext so
 // a mutation that flips a byte cannot corrupt the caller's own record.
-func relabel(w domain.WrappedDEK, mutate func(*domain.WrappedDEK)) domain.WrappedDEK {
+func relabel(w keyring.WrappedDEK, mutate func(*keyring.WrappedDEK)) keyring.WrappedDEK {
 	forged := w
 	forged.Ciphertext = bytes.Clone(w.Ciphertext)
 	mutate(&forged)
@@ -785,7 +802,7 @@ func errorIsAny(err error, sentinels []error) bool {
 // usable key material. Returning a DEK alongside an error would be a leak
 // that a caller which checks err first would never notice — and one that a
 // caller which forgets to check err would use.
-func assertNoDEKReturned(t *testing.T, label string, dek domain.DEK) {
+func assertNoDEKReturned(t *testing.T, label string, dek keyring.DEK) {
 	t.Helper()
 	if !dek.IsZero() {
 		t.Fatalf("%s returned an error and key material; a failed operation must return no key", label)
@@ -820,9 +837,9 @@ func assertNoKeyMaterial(t *testing.T, label, text string, material []byte) {
 }
 
 // newDEK returns a fresh DEK that is destroyed when the test ends.
-func newDEK(t *testing.T) domain.DEK {
+func newDEK(t *testing.T) keyring.DEK {
 	t.Helper()
-	dek, err := domain.NewDEK()
+	dek, err := keyring.NewDEK()
 	if err != nil {
 		t.Fatalf("NewDEK: %v", err)
 	}
@@ -833,15 +850,15 @@ func newDEK(t *testing.T) domain.DEK {
 // newKEKID returns a KEK id unique to this process run, so subtests of an
 // adapter whose backend outlives a single test — one OpenBao instance, one
 // KMS account — never collide on a key name.
-func newKEKID(t *testing.T) domain.KEKID {
+func newKEKID(t *testing.T) keyring.KEKID {
 	t.Helper()
-	return domain.KEKID("keyring-suite-kek-" + randomHex(t))
+	return keyring.KEKID("keyring-suite-kek-" + randomHex(t))
 }
 
 // newKeyID returns a key id unique to this process run.
-func newKeyID(t *testing.T) domain.KeyID {
+func newKeyID(t *testing.T) keyring.KeyID {
 	t.Helper()
-	return domain.KeyID("keyring-suite-key-" + randomHex(t))
+	return keyring.KeyID("keyring-suite-key-" + randomHex(t))
 }
 
 // randomHex returns 16 hex characters of cryptographically random text.

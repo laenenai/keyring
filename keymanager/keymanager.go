@@ -9,21 +9,25 @@
 //
 // Every adapter — local here, openbao-transit and external-kms alongside it,
 // and an adapter a consumer writes against its own KMS — must pass
-// RunKeyManagerSuite in suite.go unchanged; that suite, not this file, is the
+// keyringtest.RunKeyManagerSuite unchanged; that suite, not this file, is the
 // authoritative description of the contract's edge-case behavior, including
 // what fails closed, what is idempotent, and what a destroyed KEK does to
-// the DEKs wrapped under it.
+// the DEKs wrapped under it. The suite lives in a sibling package rather than
+// beside this one so that importing the port does not drag testing into a
+// consumer's production import graph (see CONVENTIONS.md and keyringtest's
+// own package comment).
 //
-// This package is deliberately NOT under internal/, unlike its counterpart
-// cas/internal/blob: CHARTER.md defines adoption as this module's suite
-// running green in the consumer's own CI against the consumer's own wiring,
-// and Go's internal rule would make that impossible.
+// The port and the adapters live together under keymanager/ so that each
+// adapter package reads as one of the key managers rather than as a
+// free-floating package; a consumer names the interface as keyring.KeyManager
+// and the adapter it wires by that adapter's Open.
 //
 // No error returned by any KeyManager method, and no message logged by an
 // adapter, may contain key material in any encoding — raw, hex, or base64.
 // Identifiers (a KEK id, a key id, a version) are not secret and may appear;
-// the material never may. See suite.go's NoKeyMaterialLeaksInErrors subtest,
-// which every adapter exercises, and domain.DEK's redacted renderings, which
+// the material never may. See keyringtest's NoKeyMaterialLeaksInErrors
+// subtest, which every adapter exercises, and domain.DEK's redacted
+// renderings, which
 // make the common mistake impossible rather than merely forbidden.
 package keymanager
 
@@ -34,7 +38,8 @@ import (
 )
 
 // KeyManager is the port every key manager adapter implements. See the
-// package doc comment and suite.go for the full contract.
+// package doc comment and keyringtest.RunKeyManagerSuite for the full
+// contract.
 //
 // Three levels of key exist (CAS design §8.3): a deployment root key, a KEK
 // per unit of isolation, and a DEK per encrypted object. Only the third ever

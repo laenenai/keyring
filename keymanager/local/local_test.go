@@ -13,8 +13,8 @@ import (
 	"testing"
 
 	"github.com/laenen-ai/keyring"
-	"github.com/laenen-ai/keyring/keymanager"
 	"github.com/laenen-ai/keyring/keymanager/local"
+	"github.com/laenen-ai/keyring/keyringtest"
 )
 
 // TestLocalKeyManagerConformance is the authoritative test for this
@@ -26,7 +26,7 @@ import (
 func TestLocalKeyManagerConformance(t *testing.T) {
 	t.Parallel()
 
-	keymanager.RunKeyManagerSuite(t, func(t *testing.T) keymanager.KeyManager {
+	keyringtest.RunKeyManagerSuite(t, func(t *testing.T) keyring.KeyManager {
 		return newKeyManager(t, randomRootKey(t), local.NewMemKEKStore())
 	})
 }
@@ -437,7 +437,7 @@ func TestMemKEKStoreSemantics(t *testing.T) {
 
 // newKeyManager opens a local key manager over root and store, failing the
 // test rather than returning an error.
-func newKeyManager(t *testing.T, root []byte, store local.KEKStore) keymanager.KeyManager {
+func newKeyManager(t *testing.T, root []byte, store local.KEKStore) keyring.KeyManager {
 	t.Helper()
 	km, err := local.Open(context.Background(), local.Config{RootKey: root, Store: store})
 	if err != nil {

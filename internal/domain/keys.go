@@ -17,7 +17,7 @@
 //     slog.LogValuer, all of them yielding Redacted, so the material cannot
 //     reach an error string, a log line or a JSON body by way of %v, %+v,
 //     %#v, a structured log attribute, or a struct that happens to contain
-//     a DEK. The conformance suite in ../../keymanager/suite.go asserts the
+//     a DEK. The conformance suite in ../../keyringtest asserts the
 //     adapter-level half of the same invariant.
 //
 // The root package keyring re-exports what a consumer needs to name as type
