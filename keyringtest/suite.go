@@ -325,7 +325,10 @@ func RunKeyManagerSuite(t *testing.T, newKM func(t *testing.T) keyring.KeyManage
 		kekID := newKEKID(t)
 
 		type record struct {
-			wrapped  keyring.WrappedDEK
+			wrapped keyring.WrappedDEK
+			//redact:plain — a canary this subtest searches renderings for,
+			// not material a running system holds; see redactlint's
+			// -include-tests and CONVENTIONS.md's "Rendering a secret".
 			material []byte
 		}
 		records := make([]record, 0, 3)
