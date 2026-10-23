@@ -1,10 +1,19 @@
-// Package keyringtest is the conformance suite for the keyring module: the
-// authoritative, executable description of what a keyring.KeyManager must
-// do. The interface in keymanager says what the operations are called;
-// RunKeyManagerSuite here says what they mean, including every edge the
-// interface cannot state — what fails closed, what is idempotent, which
-// errors are deliberately uninformative, and what a destroyed KEK does to
-// the DEKs wrapped under it.
+// Package keyringtest holds the conformance suites for the keyring module:
+// the authoritative, executable description of what this module's ports must
+// do. An interface says what the operations are called; the suites here say
+// what they mean, including every edge an interface cannot state — what fails
+// closed, what is idempotent, which errors are deliberately uninformative,
+// and what a destroyed KEK does to the DEKs wrapped under it.
+//
+// There are two, one per port:
+//
+//   - RunKeyManagerSuite, for keyring.KeyManager. Every adapter passes it:
+//     the in-process AES-GCM one, the OpenBao transit one, and an adapter a
+//     consumer writes against its own KMS.
+//   - RunKEKStoreSuite, for local.KEKStore, where the local adapter keeps
+//     wrapped KEK material. It exists so that the persistent implementation
+//     CAS design §8.3 calls for is held to exactly what the in-memory one
+//     does.
 //
 // It is a sibling package rather than a suite.go inside keymanager for two
 // reasons, both forced (see CONVENTIONS.md). Identifiers in _test.go files

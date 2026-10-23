@@ -32,8 +32,12 @@ var ErrKEKVersionExists = errors.New("keyring/local: KEK version already exists"
 // nothing without the root key, which is the property that makes a stolen
 // database backup useless (CAS design §8.1).
 //
-// Three rules an implementation must hold, which MemKEKStore's behavior and
-// local_test.go's TestMemKEKStoreSemantics pin exactly:
+// The authoritative description of this contract is
+// keyringtest.RunKEKStoreSuite, not this comment: an implementation counts as
+// correct when that suite runs green against it, which is what will hold the
+// persistent store CAS design §8.3 calls for to the same semantics the
+// in-memory one has. Three rules it turns on, stated here because they are
+// the ones a reader of this interface needs:
 //
 //  1. Destruction is terminal. Once DestroyKEK has been called for a KEK id,
 //     every method naming that id returns domain.ErrKEKDestroyed forever —

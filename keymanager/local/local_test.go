@@ -356,83 +356,20 @@ func TestWrongRootKeyCannotUnwrap(t *testing.T) {
 	}
 }
 
-// TestMemKEKStoreSemantics covers the store contract directly, since the
-// Postgres store a deployment supplies has to implement the same one and
-// this is the only place it is written down in executable form.
-func TestMemKEKStoreSemantics(t *testing.T) {
+// TestMemKEKStoreConformance holds the in-memory store to the shared
+// KEKStore contract. The semantics used to be pinned by a test of this one
+// implementation, which could not be run against the persistent store CAS
+// design §8.3 calls for; they are now a suite, so that store is held to the
+// same contract rather than to whatever its author inferred.
+func TestMemKEKStoreConformance(t *testing.T) {
 	t.Parallel()
 
-	ctx := context.Background()
-	store := local.NewMemKEKStore()
-	material := bytes.Repeat([]byte{0x5A}, 48)
-
-	if _, err := store.CurrentKEKVersion(ctx, "absent"); !errors.Is(err, keyring.ErrKEKNotFound) {
-		t.Fatalf("CurrentKEKVersion(absent) error = %v, want ErrKEKNotFound", err)
-	}
-	if _, err := store.WrappedKEK(ctx, "absent", keyring.FirstKEKVersion); !errors.Is(err, keyring.ErrKEKNotFound) {
-		t.Fatalf("WrappedKEK(absent) error = %v, want ErrKEKNotFound", err)
-	}
-	if err := store.DestroyKEK(ctx, "absent"); !errors.Is(err, keyring.ErrKEKNotFound) {
-		t.Fatalf("DestroyKEK(absent) error = %v, want ErrKEKNotFound", err)
-	}
-
-	if err := store.CreateKEKVersion(ctx, "kek-1", keyring.FirstKEKVersion, material); err != nil {
-		t.Fatalf("CreateKEKVersion: %v", err)
-	}
-	if err := store.CreateKEKVersion(ctx, "kek-1", keyring.FirstKEKVersion, material); !errors.Is(err, local.ErrKEKVersionExists) {
-		t.Fatalf("CreateKEKVersion of an existing version error = %v, want ErrKEKVersionExists", err)
-	}
-
-	got, err := store.WrappedKEK(ctx, "kek-1", keyring.FirstKEKVersion)
-	if err != nil {
-		t.Fatalf("WrappedKEK: %v", err)
-	}
-	if !bytes.Equal(got, material) {
-		t.Fatal("WrappedKEK returned different bytes than were stored")
-	}
-	// The store must not hand out a slice its caller can mutate in place.
-	clear(got)
-	again, err := store.WrappedKEK(ctx, "kek-1", keyring.FirstKEKVersion)
-	if err != nil {
-		t.Fatalf("WrappedKEK: %v", err)
-	}
-	if !bytes.Equal(again, material) {
-		t.Fatal("mutating the bytes returned by WrappedKEK changed the stored record")
-	}
-
-	if _, err := store.WrappedKEK(ctx, "kek-1", keyring.KEKVersion(9)); !errors.Is(err, keyring.ErrKEKNotFound) {
-		t.Fatalf("WrappedKEK(unknown version) error = %v, want ErrKEKNotFound", err)
-	}
-
-	if err := store.CreateKEKVersion(ctx, "kek-1", keyring.KEKVersion(2), material); err != nil {
-		t.Fatalf("CreateKEKVersion(v2): %v", err)
-	}
-	current, err := store.CurrentKEKVersion(ctx, "kek-1")
-	if err != nil {
-		t.Fatalf("CurrentKEKVersion: %v", err)
-	}
-	if current != keyring.KEKVersion(2) {
-		t.Fatalf("CurrentKEKVersion = %s, want v2 (the highest created version)", current)
-	}
-
-	if err := store.DestroyKEK(ctx, "kek-1"); err != nil {
-		t.Fatalf("DestroyKEK: %v", err)
-	}
-	if err := store.DestroyKEK(ctx, "kek-1"); err != nil {
-		t.Fatalf("second DestroyKEK = %v, want nil (idempotent for a known KEK)", err)
-	}
-	for _, check := range []struct {
-		name string
-		err  error
-	}{
-		{"CurrentKEKVersion", func() error { _, err := store.CurrentKEKVersion(ctx, "kek-1"); return err }()},
-		{"WrappedKEK", func() error { _, err := store.WrappedKEK(ctx, "kek-1", keyring.FirstKEKVersion); return err }()},
-		{"CreateKEKVersion", store.CreateKEKVersion(ctx, "kek-1", keyring.KEKVersion(3), material)},
-	} {
-		if !errors.Is(check.err, keyring.ErrKEKDestroyed) {
-			t.Errorf("%s after DestroyKEK error = %v, want ErrKEKDestroyed", check.name, check.err)
-		}
-	}
+	// The factory takes the subtest's own *T so that an implementation can
+	// register setup and teardown with it; an in-memory store needs neither,
+	// which is why this one ignores it.
+	keyringtest.RunKEKStoreSuite(t, func(_ *testing.T) local.KEKStore {
+		return local.NewMemKEKStore()
+	})
 }
 
 // newKeyManager opens a local key manager over root and store, failing the

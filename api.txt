@@ -153,4 +153,5 @@ func (k *KeyManager) WrapDEK(ctx context.Context, kekID domain.KEKID, keyID doma
 func Open(ctx context.Context, cfg Config) (*KeyManager, error)
 
 # github.com/laenen-ai/keyring/keyringtest
+func RunKEKStoreSuite(t *testing.T, newStore func(t *testing.T) local.KEKStore)
 func RunKeyManagerSuite(t *testing.T, newKM func(t *testing.T) keyring.KeyManager)
