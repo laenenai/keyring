@@ -50,8 +50,11 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"os"
 	"sync"
 
@@ -125,6 +128,46 @@ type Config struct {
 	// of every encrypted byte — see MemKEKStore, which a test or a
 	// deliberately ephemeral process can pass explicitly.
 	Store KEKStore
+}
+
+// String renders the configuration with the deployment root key redacted,
+// and with the path it may have been read from redacted too: in a container
+// that path is a mounted secret, and naming it describes the deployment's
+// secret handling to anyone reading the log. The store is named by type,
+// which is the part that is worth having in a log line.
+//
+// This and the three methods below exist because Config is the single most
+// likely place for the deployment root key to escape — a caller that logs or
+// serializes its configuration at startup is doing the normal thing, and
+// before these methods that printed the root key. See CONVENTIONS.md's
+// "Rendering a secret".
+func (c Config) String() string {
+	return fmt.Sprintf("local.Config{RootKey: %s, RootKeyFile: %s, Store: %T}",
+		domain.Redacted, domain.Redacted, c.Store)
+}
+
+// Format implements fmt.Formatter, which is the only interface fmt consults
+// for every verb. Without it, %#v, %d and %c reflect the struct and print
+// RootKey byte by byte, whatever String says.
+func (c Config) Format(s fmt.State, _ rune) { _, _ = io.WriteString(s, c.String()) }
+
+// MarshalJSON renders the same redacted summary as a JSON string. Without
+// it, encoding/json reaches RootKey through its exported field and emits the
+// deployment root key as base64 — the one encoding that survives being
+// pasted anywhere.
+func (c Config) MarshalJSON() ([]byte, error) { return json.Marshal(c.String()) }
+
+// LogValue renders the configuration as a slog group with the root key and
+// its path redacted, so slog.Any("config", cfg) is safe under every handler.
+// slog's JSONHandler marshals a non-LogValuer attribute with encoding/json
+// and therefore does not consult String at all, which is why this is needed
+// in addition to MarshalJSON rather than instead of it.
+func (c Config) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.String("root_key", domain.Redacted),
+		slog.String("root_key_file", domain.Redacted),
+		slog.String("store", fmt.Sprintf("%T", c.Store)),
+	)
 }
 
 // KeyManager is the local adapter's implementation of
@@ -655,4 +698,35 @@ func validateRootKey(root []byte, source string) error {
 		return fmt.Errorf("%w: %s is all zero bytes, which is a misconfigured secret rather than a key", domain.ErrInvalidConfig, source)
 	}
 	return nil
+}
+
+// String renders the manager without its derived wrapping key. A KeyManager
+// is a plausible thing to log — it is what Open returns, so it is in scope
+// wherever the error handling around Open is — and its wrapKey field is
+// AES-256 key material derived from the deployment root key. Printing the
+// manager must not print the key.
+//
+// The receiver is a pointer because KeyManager holds a sync.Mutex: a value
+// receiver would copy it, which go vet's copylocks check correctly rejects.
+// Open returns *KeyManager, so the pointer is what a consumer holds anyway.
+func (k *KeyManager) String() string {
+	return fmt.Sprintf("local.KeyManager{wrapKey: %s, store: %T}", domain.Redacted, k.store)
+}
+
+// Format implements fmt.Formatter so that every verb — not only the five fmt
+// routes through Stringer — yields the redacted summary.
+func (k *KeyManager) Format(s fmt.State, _ rune) { _, _ = io.WriteString(s, k.String()) }
+
+// MarshalJSON renders the redacted summary. encoding/json skips unexported
+// fields, so a KeyManager already marshalled to "{}" — but that is safety by
+// accident, and it ends the moment a field is exported.
+func (k *KeyManager) MarshalJSON() ([]byte, error) { return json.Marshal(k.String()) }
+
+// LogValue renders the manager as a slog group with the wrapping key
+// redacted.
+func (k *KeyManager) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.String("wrap_key", domain.Redacted),
+		slog.String("store", fmt.Sprintf("%T", k.store)),
+	)
 }

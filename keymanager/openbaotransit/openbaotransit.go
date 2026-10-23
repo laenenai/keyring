@@ -160,6 +160,19 @@ func (c Config) String() string {
 		c.Address, domain.Redacted, c.MountPath)
 }
 
+// Format implements fmt.Formatter. String and LogValue were not enough on
+// their own: fmt consults Stringer for %v, %s, %q, %x and %X and for no
+// other verb, so %#v, %d and %c reflected this struct and printed Token in
+// full. fmt.Formatter is the only interface consulted for every verb. See
+// CONVENTIONS.md's "Rendering a secret".
+func (c Config) Format(s fmt.State, _ rune) { _, _ = io.WriteString(s, c.String()) }
+
+// MarshalJSON renders the same redacted summary as a JSON string. Token is an
+// exported field, so encoding/json reached it directly and emitted the
+// OpenBao token verbatim — and slog's JSONHandler, which marshals a
+// non-LogValuer attribute with encoding/json, did the same.
+func (c Config) MarshalJSON() ([]byte, error) { return json.Marshal(c.String()) }
+
 // LogValue renders the configuration as a slog group with the token redacted,
 // so slog.Any("config", cfg) is safe.
 func (c Config) LogValue() slog.Value {
@@ -904,3 +917,29 @@ func isPrintableASCII(b []byte) bool {
 
 // The adapter is held to the port at compile time.
 var _ keymanager.KeyManager = (*KeyManager)(nil)
+
+// String renders the manager without its token. A *KeyManager is what Open
+// returns, so it is in scope wherever Open's error handling is, and its token
+// field is the credential that authenticates this process to OpenBao.
+func (k *KeyManager) String() string {
+	return fmt.Sprintf("openbaotransit.KeyManager{base: %q, mount: %q, token: %s}",
+		k.base, k.mount, domain.Redacted)
+}
+
+// Format implements fmt.Formatter so that every verb yields the redacted
+// summary rather than only the five fmt routes through Stringer.
+func (k *KeyManager) Format(s fmt.State, _ rune) { _, _ = io.WriteString(s, k.String()) }
+
+// MarshalJSON renders the redacted summary. encoding/json skips unexported
+// fields, so a KeyManager already marshalled to "{}" — safety by accident,
+// which ends the moment a field is exported.
+func (k *KeyManager) MarshalJSON() ([]byte, error) { return json.Marshal(k.String()) }
+
+// LogValue renders the manager as a slog group with the token redacted.
+func (k *KeyManager) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.String("address", k.base),
+		slog.String("mount_path", k.mount),
+		slog.String("token", domain.Redacted),
+	)
+}

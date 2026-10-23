@@ -265,6 +265,32 @@ func TestConfigRedactsTheToken(t *testing.T) {
 			t.Errorf("a Config rendering does not say it redacted anything: %s", rendering)
 		}
 	}
+
+	// String and LogValue were what this test checked, and they were not
+	// enough: %#v, %d and %c reflected the struct and printed the token, and
+	// json.Marshal reached Token through its exported field. The named
+	// subtest covers every rendering rather than the two a reader thinks of.
+	keyringtest.NoSecretLeaksInAnyRendering(t, cfg, []byte(token))
+}
+
+// TestKeyManagerRedactsTheTokenInEveryRendering covers the value Open hands
+// back, not just the config it was given: a *KeyManager retains the token as
+// the X-Vault-Token header value, and it is in scope wherever the error
+// handling around Open is.
+func TestKeyManagerRedactsTheTokenInEveryRendering(t *testing.T) {
+	t.Parallel()
+
+	const token = "s.another-very-secret-openbao-token"
+	km, err := openbaotransit.Open(context.Background(), openbaotransit.Config{
+		Address:   "https://openbao.invalid:8200",
+		Token:     token,
+		MountPath: "transit",
+	})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	keyringtest.NoSecretLeaksInAnyRendering(t, km, []byte(token))
 }
 
 // TestRecordVersionMismatchIsRejectedWithoutTheServer runs in -short, and

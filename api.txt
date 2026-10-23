@@ -51,6 +51,8 @@ type WrappedDEK = domain.WrappedDEK
 
 package keyringtest // keyringtest
 
+func NoSecretLeaksInAnyRendering(t *testing.T, v any, material []byte)
+
 func RunKEKStoreSuite(t *testing.T, newStore func(t *testing.T) local.KEKStore)
 
 func RunKeyManagerSuite(t *testing.T, newKM func(t *testing.T) keyring.KeyManager)
@@ -66,6 +68,8 @@ func (DEK) Bytes() []byte
 func (*DEK) Destroy()
 
 func (DEK) Equal(other DEK) bool
+
+func (DEK) Format(s fmt.State, _ rune)
 
 func (DEK) GoString() string
 
@@ -161,6 +165,14 @@ type Config struct {
 	Store KEKStore
 }
 
+func (Config) Format(s fmt.State, _ rune)
+
+func (Config) LogValue() slog.Value
+
+func (Config) MarshalJSON() ([]byte, error)
+
+func (Config) String() string
+
 var ErrKEKVersionExists = errors.New("keyring/local: KEK version already exists")
 
 type KEKStore interface {
@@ -176,11 +188,19 @@ type KeyManager struct {
 
 func (*KeyManager) DestroyKEK(ctx context.Context, kekID domain.KEKID) error
 
+func (*KeyManager) Format(s fmt.State, _ rune)
+
 func (*KeyManager) GenerateDEK(ctx context.Context, kekID domain.KEKID, keyID domain.KeyID) (domain.DEK, domain.WrappedDEK, error)
+
+func (*KeyManager) LogValue() slog.Value
+
+func (*KeyManager) MarshalJSON() ([]byte, error)
 
 func (*KeyManager) RewrapDEK(ctx context.Context, wrapped domain.WrappedDEK) (domain.WrappedDEK, error)
 
 func (*KeyManager) RotateKEK(ctx context.Context, kekID domain.KEKID) (domain.KEKVersion, error)
+
+func (*KeyManager) String() string
 
 func (*KeyManager) UnwrapDEK(ctx context.Context, wrapped domain.WrappedDEK) (domain.DEK, error)
 
@@ -215,7 +235,11 @@ type Config struct {
 	HTTPClient *http.Client
 }
 
+func (Config) Format(s fmt.State, _ rune)
+
 func (Config) LogValue() slog.Value
+
+func (Config) MarshalJSON() ([]byte, error)
 
 func (Config) String() string
 
@@ -229,11 +253,19 @@ type KeyManager struct {
 
 func (*KeyManager) DestroyKEK(ctx context.Context, kekID domain.KEKID) error
 
+func (*KeyManager) Format(s fmt.State, _ rune)
+
 func (*KeyManager) GenerateDEK(ctx context.Context, kekID domain.KEKID, keyID domain.KeyID) (domain.DEK, domain.WrappedDEK, error)
+
+func (*KeyManager) LogValue() slog.Value
+
+func (*KeyManager) MarshalJSON() ([]byte, error)
 
 func (*KeyManager) RewrapDEK(ctx context.Context, wrapped domain.WrappedDEK) (domain.WrappedDEK, error)
 
 func (*KeyManager) RotateKEK(ctx context.Context, kekID domain.KEKID) (domain.KEKVersion, error)
+
+func (*KeyManager) String() string
 
 func (*KeyManager) UnwrapDEK(ctx context.Context, wrapped domain.WrappedDEK) (domain.DEK, error)
 

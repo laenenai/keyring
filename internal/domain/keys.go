@@ -13,12 +13,16 @@
 //     therefore not an ordinary value: copying it is cheap but does not
 //     duplicate the secret.
 //  2. Key material never renders. DEK implements fmt.Stringer,
-//     fmt.GoStringer, encoding.TextMarshaler, json.Marshaler and
-//     slog.LogValuer, all of them yielding Redacted, so the material cannot
-//     reach an error string, a log line or a JSON body by way of %v, %+v,
-//     %#v, a structured log attribute, or a struct that happens to contain
-//     a DEK. The conformance suite in ../../keyringtest asserts the
-//     adapter-level half of the same invariant.
+//     fmt.Formatter, fmt.GoStringer, encoding.TextMarshaler, json.Marshaler
+//     and slog.LogValuer, all of them yielding Redacted, so the material
+//     cannot reach an error string, a log line or a JSON body by way of any
+//     fmt verb, a structured log attribute, or a struct that happens to
+//     contain a DEK. fmt.Formatter is the load-bearing one and was the one
+//     missing: fmt consults Stringer for %v, %s, %q, %x and %X only, so %d
+//     printed the whole key until Format existed. See CONVENTIONS.md's
+//     "Rendering a secret", and keyringtest's NoSecretLeaksInAnyRendering,
+//     which asserts the same invariant against whatever DEK an adapter
+//     actually returns.
 //
 // The root package keyring re-exports what a consumer needs to name as type
 // aliases, so a WrappedDEK an adapter returns and a keyring.WrappedDEK the
@@ -30,6 +34,7 @@ import (
 	"crypto/rand"
 	"crypto/subtle"
 	"fmt"
+	"io"
 	"log/slog"
 	"strconv"
 	"strings"
@@ -219,9 +224,30 @@ func (k *DEK) Destroy() {
 // renderings that keep key material out of errors and logs.
 func (k DEK) String() string { return "DEK(" + Redacted + ")" }
 
-// GoString returns Redacted, so %#v and a Go-syntax dump of a struct
-// containing a DEK leak nothing either.
+// GoString returns Redacted, so a caller reaching for a Go-syntax dump of a
+// DEK gets the placeholder. Format, below, is what fmt actually consults for
+// %#v now that it exists; this method is kept because it is exported and a
+// consumer may call it directly.
 func (k DEK) GoString() string { return "domain.DEK{" + Redacted + "}" }
+
+// Format implements fmt.Formatter, and it is the method that makes this
+// type's redaction complete rather than nearly complete.
+//
+// fmt consults Stringer for %v, %s, %q, %x and %X, and for no other verb.
+// Every other verb falls through to reflection and prints the struct's
+// fields — so before this method existed, with Stringer, GoStringer,
+// MarshalText, MarshalJSON and LogValue all in place, fmt.Sprintf("%d", dek)
+// printed every one of the DEKSize key bytes in decimal, and %c, %U, %b and
+// %o did the same in their own alphabets. fmt.Formatter is the only interface
+// consulted for every verb, which is why CONVENTIONS.md requires it and not
+// just the other three.
+//
+// Every verb, flag, width and precision yields the same placeholder: a verb
+// is a request about presentation, and this value has no presentation to
+// vary. The one verb no method can cover is %p, whose bad-verb path skips
+// every interface and reflects the operand; CONVENTIONS.md records that hole
+// and its mitigation.
+func (k DEK) Format(s fmt.State, _ rune) { _, _ = io.WriteString(s, k.String()) }
 
 // MarshalText returns Redacted. A DEK has no text form on purpose; it is
 // persisted only in its wrapped form, as a WrappedDEK.
