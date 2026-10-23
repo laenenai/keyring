@@ -16,10 +16,11 @@ repos read as one codebase.
 - **`forbidigo` forbids `fmt.Print*` and `panic`** outside `cmd/`. Return
   errors; log through the injected logger.
 - `mise` tasks, same names and same meanings as `cas`: `fmt`, `fmt-check`,
-  `lint`, `test`, `build`, `test-all`, plus `api` / `api-check`, and `check`
-  as the gate — it depends on `fmt-check lint build api-check test-all`.
-  `api-check` is in the gate because the charter requires `api.txt` to be
-  diffed in CI and the gate is where that belongs.
+  `lint`, `test`, `build`, `test-all`, plus `api`, and `check` as the gate —
+  it depends on `fmt-check lint build test-all`.
+  There is no `api-check` task: the golden file is verified by an ordinary
+  test, so `test` and `test-all` already cover it and the check cannot be
+  forgotten. `api` only rewrites it.
 - **A module's `mise.toml` is not a copy of cas's.** cas's `migrate`, `dev`,
   `up`, `down`, `reset`, `db` and observability tasks reference `./cmd/casd`
   and `deploy/compose/`, and its `generate` runs `sqlc`/`buf`; none of that
@@ -108,6 +109,53 @@ exercised against the real thing:
 A module whose only adapter is in-memory is an unfinished module, and its
 charter's adoption row should say so.
 
+## When something deserves its own module
+
+Asked about `Clock`, 2026-10-23, and the reasoning is reusable. Two questions,
+in order:
+
+**1. Does it have behaviour that can be wrong?** Not "is it duplicated" — Go
+makes duplication of a *shape* free. Ask whether a second implementation could
+behave differently in a way that matters, and what the blast radius is.
+
+| Thing | Can it be wrong? | Verdict |
+|---|---|---|
+| RLS fail-closed scoping | yes → cross-tenant disclosure | `tenancy` |
+| Authorization evaluation | yes → disclosure | `iam` |
+| A canonical encoding / hash chain | yes → previously stored data unreadable, or tamper-evidence lost | `audit` |
+| Envelope AAD binding | yes → a relocated value decrypts to the wrong answer | `seal` |
+| Threshold key custody | yes → unrecoverable release | `escrow` |
+| `Now() time.Time` | **no** — returning the current time is not a thing you get subtly wrong | not a module |
+
+**2. Does sharing reduce risk, or only reduce typing?** Reducing typing is not
+worth a `go.mod`, a charter, a CI pipeline, an `api.txt` and a release cadence.
+For `Clock` the ceremony would exceed the content roughly thirtyfold.
+
+### So: `Clock` is a convention, not a module
+
+Each module declares it in `internal/domain/clock.go`, with the same shape —
+`Clock` with one `Now() time.Time`, a `SystemClock`, and a `FixedClock` with
+`Advance`. Go's structural typing means those independently declared interfaces
+are interchangeable: a `SystemClock` from anywhere satisfies all of them, at
+zero coupling. This is also Go's own idiom — the standard library ships no
+`Clock`, because accepting the narrow interface you declare keeps the
+dependency graph empty and the interface minimal.
+
+And the failure mode a shared clock module invites is the one this whole
+decomposition exists to avoid: today `Now()`, tomorrow `After`, `Sleep`,
+`Timer`, `Ticker`, a time-travel fake, eventually a scheduler. That is
+`platform` in miniature.
+
+### The one piece of time handling that IS shared logic
+
+**`CanonicalTime`** — truncating to UTC microseconds (see the timestamp
+precision rule above) — *can* be wrong: truncate versus round, and the order of
+UTC conversion versus truncation both change the result. It is three lines, so
+it is still not a module, but it must be **the same three lines with the same
+test in every module that digests, keys or compares an instant.** `audit` has
+`domain.CanonicalTime`; copy it rather than reinventing it, and copy its test
+with it.
+
 ## Package layout
 
 - All domain types and value objects live in `internal/domain` and nowhere
@@ -168,5 +216,17 @@ the wrong reason.
 
 - `CHARTER.md` is binding. Code that does not fit the charter belongs in a
   different module — raise it rather than widening the charter.
-- `api.txt` is the public API as a golden file, regenerated and diffed in CI.
-  Growing the public surface is a reviewed diff.
+- `api.txt` is the public API as a golden file. Growing the public surface is
+  a reviewed diff.
+- **It is generated and checked by an ordinary test**, `api_test.go`, with an
+  `-update-api` flag to rewrite it — Go's golden-file idiom. Not by a
+  `cmd/apilist` main package: that puts a `main` in a library module's public
+  tree, and it has to be remembered. A test runs inside `go test`, so `test`
+  and `test-all` verify the surface automatically and there is no separate
+  `api-check` task to forget. `mise run api` only rewrites.
+- **`api.txt` must cover the `internal/` packages the facade aliases**, not
+  only the importable ones. Because the facade re-exports internal types as
+  aliases, **a change to an internal signature is a change to the public
+  surface** even though Go's internal rule keeps the import path private. A
+  generator listing only importable packages reports an incomplete surface —
+  converting `meter` took its golden file from 76 lines to 261.

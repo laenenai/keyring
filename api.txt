@@ -129,19 +129,28 @@ func NewMemKEKStore() *MemKEKStore
 func Open(ctx context.Context, cfg Config) (*KeyManager, error)
 
 # github.com/laenen-ai/keyring/keymanager/openbaotransit
+const DefaultMountPath = "transit"
+const DefaultTimeout = 30 * time.Second
+const KeyNamePrefix = "kek-"
+const TombstoneNamePrefix = "destroyed-kek-"
 type Config struct {
 	Address string
 	Token string
 	MountPath string
+	HTTPClient *http.Client
 }
-type KeyManager struct {}
-func (k *KeyManager) DestroyKEK(_ context.Context, _ domain.KEKID) error
-func (k *KeyManager) GenerateDEK(_ context.Context, _ domain.KEKID, _ domain.KeyID) (domain.DEK, domain.WrappedDEK, error)
-func (k *KeyManager) RewrapDEK(_ context.Context, _ domain.WrappedDEK) (domain.WrappedDEK, error)
-func (k *KeyManager) RotateKEK(_ context.Context, _ domain.KEKID) (domain.KEKVersion, error)
-func (k *KeyManager) UnwrapDEK(_ context.Context, _ domain.WrappedDEK) (domain.DEK, error)
-func (k *KeyManager) WrapDEK(_ context.Context, _ domain.KEKID, _ domain.KeyID, _ domain.DEK) (domain.WrappedDEK, error)
-func Open(_ context.Context, _ Config) (*KeyManager, error)
+type KeyManager struct {
+	// has unexported fields
+}
+func (c Config) LogValue() slog.Value
+func (c Config) String() string
+func (k *KeyManager) DestroyKEK(ctx context.Context, kekID domain.KEKID) error
+func (k *KeyManager) GenerateDEK(ctx context.Context, kekID domain.KEKID, keyID domain.KeyID) (domain.DEK, domain.WrappedDEK, error)
+func (k *KeyManager) RewrapDEK(ctx context.Context, wrapped domain.WrappedDEK) (domain.WrappedDEK, error)
+func (k *KeyManager) RotateKEK(ctx context.Context, kekID domain.KEKID) (domain.KEKVersion, error)
+func (k *KeyManager) UnwrapDEK(ctx context.Context, wrapped domain.WrappedDEK) (domain.DEK, error)
+func (k *KeyManager) WrapDEK(ctx context.Context, kekID domain.KEKID, keyID domain.KeyID, dek domain.DEK) (domain.WrappedDEK, error)
+func Open(ctx context.Context, cfg Config) (*KeyManager, error)
 
 # github.com/laenen-ai/keyring/keyringtest
 func RunKeyManagerSuite(t *testing.T, newKM func(t *testing.T) keyring.KeyManager)
