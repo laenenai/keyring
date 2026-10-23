@@ -37,7 +37,7 @@ var apiPackages = []string{
 	"keymanager/externalkms",
 }
 
-const apiHeader = `# Public API of github.com/laenen-ai/keyring, as a golden file.
+const apiHeader = `# Public API of github.com/laenenai/keyring, as a golden file.
 #
 # Regenerate with: go test . -run TestAPIGolden -update-api
 #

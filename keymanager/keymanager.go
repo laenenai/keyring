@@ -34,7 +34,7 @@ package keymanager
 import (
 	"context"
 
-	"github.com/laenen-ai/keyring/internal/domain"
+	"github.com/laenenai/keyring/internal/domain"
 )
 
 // KeyManager is the port every key manager adapter implements. See the

@@ -9,7 +9,7 @@ import (
 	"slices"
 	"sync"
 
-	"github.com/laenen-ai/keyring/internal/domain"
+	"github.com/laenenai/keyring/internal/domain"
 )
 
 // ErrKEKVersionExists is returned by KEKStore.CreateKEKVersion when the

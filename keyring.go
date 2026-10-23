@@ -38,8 +38,8 @@
 package keyring
 
 import (
-	"github.com/laenen-ai/keyring/internal/domain"
-	"github.com/laenen-ai/keyring/keymanager"
+	"github.com/laenenai/keyring/internal/domain"
+	"github.com/laenenai/keyring/keymanager"
 )
 
 type (

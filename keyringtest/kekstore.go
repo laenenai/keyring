@@ -8,8 +8,8 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/laenen-ai/keyring"
-	"github.com/laenen-ai/keyring/keymanager/local"
+	"github.com/laenenai/keyring"
+	"github.com/laenenai/keyring/keymanager/local"
 )
 
 // RunKEKStoreSuite runs the contract every local.KEKStore implementation must

@@ -6,9 +6,9 @@ import (
 	"os"
 	"testing"
 
-	"github.com/laenen-ai/keyring"
-	"github.com/laenen-ai/keyring/keymanager/externalkms"
-	"github.com/laenen-ai/keyring/keyringtest"
+	"github.com/laenenai/keyring"
+	"github.com/laenenai/keyring/keymanager/externalkms"
+	"github.com/laenenai/keyring/keyringtest"
 )
 
 // Environment variables that point this adapter's conformance run at a real
