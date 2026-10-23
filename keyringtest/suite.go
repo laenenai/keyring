@@ -1056,6 +1056,35 @@ func RunKeyManagerSuite(t *testing.T, newKM func(t *testing.T) keyring.KeyManage
 		}
 	})
 
+	// RenderingsOfAGeneratedDEK is the other half of the invariant that
+	// NoKeyMaterialLeaksInErrors covers only partly. That subtest drives the
+	// error paths, which is where material escapes deliberately; this one
+	// covers the renderings, which is where it escapes by accident — a %v in
+	// a debug line, a %+v in a panic message, a config struct marshalled by
+	// a diagnostics endpoint, a slog.Any on something that happens to carry
+	// the key.
+	//
+	// It is in the suite rather than only in internal/domain because an
+	// adapter is free to return a DEK it built itself, and because a
+	// consumer's own adapter is exactly what this suite exists to hold.
+	// NoSecretLeaksInAnyRendering also asserts the four interfaces are
+	// present, so a DEK that happens not to leak today — because its
+	// material sits behind an unexported field reflection cannot reach —
+	// still fails if a method is missing.
+	t.Run("RenderingsOfAGeneratedDEK", func(t *testing.T) {
+		km := newKM(t)
+		ctx := context.Background()
+
+		dek, _, err := km.GenerateDEK(ctx, newKEKID(t), newKeyID(t))
+		if err != nil {
+			t.Fatalf("GenerateDEK: %v", err)
+		}
+		t.Cleanup(dek.Destroy)
+
+		material := bytes.Clone(dek.Bytes())
+		NoSecretLeaksInAnyRendering(t, dek, material)
+	})
+
 	t.Run("InvalidInputIsRejected", func(t *testing.T) {
 		km := newKM(t)
 		ctx := context.Background()

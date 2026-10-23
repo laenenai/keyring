@@ -392,3 +392,41 @@ func randomRootKey(t *testing.T) []byte {
 	}
 	return b
 }
+
+// TestConfigAndKeyManagerRedactTheRootKeyInEveryRendering is a regression
+// test for a real leak. local.Config carries the deployment root key in an
+// exported RootKey field and had no rendering methods at all, so
+// fmt.Sprintf("%v", cfg) printed the key's bytes and json.Marshal(cfg)
+// emitted them as base64 — the encoding most likely to survive being pasted
+// into an issue. local.KeyManager retains the wrapping key derived from it
+// and had no methods either.
+//
+// A configuration struct logged at startup is the normal thing for a caller
+// to do, which is what makes this the leak that matters rather than a
+// theoretical one.
+func TestConfigAndKeyManagerRedactTheRootKeyInEveryRendering(t *testing.T) {
+	t.Parallel()
+
+	root := randomRootKey(t)
+	cfg := local.Config{
+		RootKey:     root,
+		RootKeyFile: "",
+		Store:       local.NewMemKEKStore(),
+	}
+
+	t.Run("Config", func(t *testing.T) {
+		keyringtest.NoSecretLeaksInAnyRendering(t, cfg, root)
+	})
+
+	km, err := local.Open(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Run("KeyManager", func(t *testing.T) {
+		// The manager does not retain the root key — Open zeroizes its copy
+		// once the wrapping key is derived — but the root key is what an
+		// operator would search a log for, and the derived key is material
+		// in its own right, so both are off limits.
+		keyringtest.NoSecretLeaksInAnyRendering(t, km, root)
+	})
+}

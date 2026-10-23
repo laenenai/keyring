@@ -56,9 +56,12 @@ nothing else: the conformance suite runs against both unchanged.
 - `RewrapDEK` moves a record to the current KEK version **without decrypting
   it** on the transit adapter — the plaintext key never enters this process.
   It is a first-class operation, not unwrap-then-wrap.
-- A `DEK` is zeroizable and redacted through every rendering path: `String`,
-  `GoString`, `MarshalText`, `MarshalJSON` and `slog.LogValuer`. Unmarshalling
-  one from JSON is refused.
+- A `DEK` is zeroizable and redacted through every rendering path: `Format`
+  (which is what covers *every* `fmt` verb, including the `%d` that printed the
+  key before it existed), `String`, `GoString`, `MarshalText`, `MarshalJSON`
+  and `slog.LogValuer`. Unmarshalling one from JSON is refused. Both adapters'
+  `Config` and `KeyManager` redact the same way, so logging a configuration at
+  startup does not log the deployment root key or an OpenBao token.
 
 ## Notes on the adapters
 
