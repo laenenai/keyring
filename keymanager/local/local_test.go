@@ -12,9 +12,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/laenen-ai/keyring"
-	"github.com/laenen-ai/keyring/keymanager/local"
-	"github.com/laenen-ai/keyring/keyringtest"
+	"github.com/laenenai/keyring"
+	"github.com/laenenai/keyring/keymanager/local"
+	"github.com/laenenai/keyring/keyringtest"
 )
 
 // TestLocalKeyManagerConformance is the authoritative test for this

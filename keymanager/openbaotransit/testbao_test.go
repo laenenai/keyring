@@ -17,7 +17,7 @@ import (
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
 
-	"github.com/laenen-ai/keyring/keymanager/openbaotransit"
+	"github.com/laenenai/keyring/keymanager/openbaotransit"
 )
 
 // This file is the OpenBao half of the harness CONVENTIONS.md describes for

@@ -45,7 +45,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/laenen-ai/keyring"
+	"github.com/laenenai/keyring"
 )
 
 // RunKeyManagerSuite runs the contract every KeyManager adapter must

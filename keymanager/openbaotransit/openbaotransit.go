@@ -92,8 +92,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/laenen-ai/keyring/internal/domain"
-	"github.com/laenen-ai/keyring/keymanager"
+	"github.com/laenenai/keyring/internal/domain"
+	"github.com/laenenai/keyring/keymanager"
 )
 
 // DefaultMountPath is the path transit is mounted at when Config.MountPath is

@@ -1,4 +1,4 @@
-module github.com/laenen-ai/keyring
+module github.com/laenenai/keyring
 
 go 1.25.6
 

@@ -55,7 +55,7 @@ import (
 	"os"
 	"sync"
 
-	"github.com/laenen-ai/keyring/internal/domain"
+	"github.com/laenenai/keyring/internal/domain"
 )
 
 // WrapFormatVersion is the first byte of every record this adapter writes.

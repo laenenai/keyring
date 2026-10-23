@@ -12,9 +12,9 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/laenen-ai/keyring"
-	"github.com/laenen-ai/keyring/keymanager/openbaotransit"
-	"github.com/laenen-ai/keyring/keyringtest"
+	"github.com/laenenai/keyring"
+	"github.com/laenenai/keyring/keymanager/openbaotransit"
+	"github.com/laenenai/keyring/keyringtest"
 )
 
 // TestOpenBaoTransitConformance is the authoritative test for this adapter,
