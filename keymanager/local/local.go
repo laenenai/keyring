@@ -240,6 +240,17 @@ type keyManagerState struct {
 	// reports ErrKEKVersionExists to the loser; this mutex just keeps the
 	// common single-process case from relying on it.
 	mu sync.Mutex
+
+	// locks serializes operations per KEK. A wrap or read holds the read
+	// lock for the whole operation; rotation and destruction take the write
+	// lock, so a destroy cannot interleave with an in-flight wrap and a
+	// wrap that starts after destruction sees the tombstone.
+	locks sync.Map // domain.KEKID -> *sync.RWMutex
+}
+
+func (s *keyManagerState) lockFor(id domain.KEKID) *sync.RWMutex {
+	lock, _ := s.locks.LoadOrStore(id, &sync.RWMutex{})
+	return lock.(*sync.RWMutex)
 }
 
 // Open validates cfg and returns a key manager over it.
@@ -286,6 +297,10 @@ func (k *KeyManager) WrapDEK(ctx context.Context, kekID domain.KEKID, keyID doma
 	if err := dek.Validate(); err != nil {
 		return domain.WrappedDEK{}, err
 	}
+
+	lock := k.state.lockFor(kekID)
+	lock.RLock()
+	defer lock.RUnlock()
 
 	version, err := k.currentOrCreatedVersion(ctx, kekID)
 	if err != nil {
@@ -358,6 +373,10 @@ func (k *KeyManager) UnwrapDEK(ctx context.Context, wrapped domain.WrappedDEK) (
 		return domain.DEK{}, err
 	}
 
+	lock := k.state.lockFor(wrapped.KEKID)
+	lock.RLock()
+	defer lock.RUnlock()
+
 	material, err := k.kekMaterial(ctx, wrapped.KEKID, wrapped.KEKVersion)
 	if err != nil {
 		return domain.DEK{}, err
@@ -406,6 +425,10 @@ func (k *KeyManager) RewrapDEK(ctx context.Context, wrapped domain.WrappedDEK) (
 	if err := wrapped.ValidateFormat(domain.WrappedDEKFormatLocal); err != nil {
 		return domain.WrappedDEK{}, err
 	}
+
+	lock := k.state.lockFor(wrapped.KEKID)
+	lock.RLock()
+	defer lock.RUnlock()
 
 	// Re-wrapping is not creation: a KEK with no current version is
 	// ErrKEKNotFound, and a destroyed one is ErrKEKDestroyed, both reported by
@@ -467,6 +490,10 @@ func (k *KeyManager) RotateKEK(ctx context.Context, kekID domain.KEKID) (domain.
 		return 0, err
 	}
 
+	lock := k.state.lockFor(kekID)
+	lock.Lock()
+	defer lock.Unlock()
+
 	k.state.mu.Lock()
 	defer k.state.mu.Unlock()
 
@@ -503,6 +530,10 @@ func (k *KeyManager) DestroyKEK(ctx context.Context, kekID domain.KEKID) error {
 	if err := kekID.Validate(); err != nil {
 		return err
 	}
+
+	lock := k.state.lockFor(kekID)
+	lock.Lock()
+	defer lock.Unlock()
 
 	k.state.mu.Lock()
 	defer k.state.mu.Unlock()

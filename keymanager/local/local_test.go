@@ -15,7 +15,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/laenenai/keyring"
 	"github.com/laenenai/keyring/keymanager/local"
@@ -594,5 +596,68 @@ func TestWrongAdapterFormatIsRejected(t *testing.T) {
 	}
 	if _, err := km.RewrapDEK(ctx, wrapped); !errors.Is(err, keyring.ErrInvalidWrappedDEK) {
 		t.Fatalf("RewrapDEK(wrong format) = %v, want ErrInvalidWrappedDEK", err)
+	}
+}
+
+type blockingStore struct {
+	local.KEKStore
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (s *blockingStore) CurrentKEKVersion(ctx context.Context, id keyring.KEKID) (keyring.KEKVersion, error) {
+	if id == "kek-race" {
+		s.once.Do(func() { close(s.started) })
+		<-s.release
+	}
+	return s.KEKStore.CurrentKEKVersion(ctx, id)
+}
+
+func TestDestroyWaitsForInFlightWrap(t *testing.T) {
+	t.Parallel()
+
+	store := &blockingStore{
+		KEKStore: local.NewMemKEKStore(),
+		started:  make(chan struct{}),
+		release:  make(chan struct{}),
+	}
+	km := newKeyManager(t, randomRootKey(t), store)
+	ctx := context.Background()
+	dek, err := keyring.NewDEK()
+	if err != nil {
+		t.Fatalf("NewDEK: %v", err)
+	}
+	t.Cleanup(dek.Destroy)
+
+	wrapDone := make(chan error, 1)
+	go func() {
+		_, err := km.WrapDEK(ctx, "kek-race", "key-1", dek)
+		wrapDone <- err
+	}()
+	<-store.started
+
+	destroyDone := make(chan error, 1)
+	go func() { destroyDone <- km.DestroyKEK(ctx, "kek-race") }()
+	select {
+	case err := <-destroyDone:
+		t.Fatalf("DestroyKEK completed while a wrap held the KEK: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	close(store.release)
+	if err := <-wrapDone; err != nil {
+		t.Fatalf("WrapDEK that started before destroy: %v", err)
+	}
+	if err := <-destroyDone; err != nil {
+		t.Fatalf("DestroyKEK: %v", err)
+	}
+	if _, err := km.UnwrapDEK(ctx, keyring.WrappedDEK{
+		KEKID:      "kek-race",
+		KEKVersion: keyring.FirstKEKVersion,
+		KeyID:      "key-1",
+		Ciphertext: []byte("whatever"),
+	}); !errors.Is(err, keyring.ErrKEKDestroyed) {
+		t.Fatalf("UnwrapDEK after destroy = %v, want ErrKEKDestroyed", err)
 	}
 }

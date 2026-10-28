@@ -93,6 +93,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/laenenai/keyring/internal/domain"
@@ -265,6 +266,15 @@ type KeyManager struct {
 	client *http.Client
 	// retry bounds transient retries.
 	retry RetryPolicy
+	// locks serializes operations per KEK. Reads and wraps hold the read
+	// lock; rotation and destruction hold the write lock, so a destroy
+	// cannot interleave with an in-flight wrap inside this adapter instance.
+	locks *sync.Map // domain.KEKID -> *sync.RWMutex
+}
+
+func (k *KeyManager) lockFor(id domain.KEKID) *sync.RWMutex {
+	lock, _ := k.locks.LoadOrStore(id, &sync.RWMutex{})
+	return lock.(*sync.RWMutex)
 }
 
 // Open validates cfg and returns a key manager over it.
@@ -336,6 +346,7 @@ func Open(ctx context.Context, cfg Config) (*KeyManager, error) {
 		token:  cfg.Token,
 		client: client,
 		retry:  cfg.Retry.normalized(),
+		locks:  &sync.Map{},
 	}, nil
 }
 
@@ -380,6 +391,11 @@ func (k *KeyManager) WrapDEK(ctx context.Context, kekID domain.KEKID, keyID doma
 	if err := dek.Validate(); err != nil {
 		return domain.WrappedDEK{}, err
 	}
+
+	lock := k.lockFor(kekID)
+	lock.RLock()
+	defer lock.RUnlock()
+
 	if err := k.refuseIfDestroyed(ctx, kekID); err != nil {
 		return domain.WrappedDEK{}, err
 	}
@@ -419,6 +435,11 @@ func (k *KeyManager) GenerateDEK(ctx context.Context, kekID domain.KEKID, keyID 
 	if err := keyID.Validate(); err != nil {
 		return domain.DEK{}, domain.WrappedDEK{}, err
 	}
+
+	lock := k.lockFor(kekID)
+	lock.RLock()
+	defer lock.RUnlock()
+
 	if err := k.refuseIfDestroyed(ctx, kekID); err != nil {
 		return domain.DEK{}, domain.WrappedDEK{}, err
 	}
@@ -461,6 +482,10 @@ func (k *KeyManager) UnwrapDEK(ctx context.Context, wrapped domain.WrappedDEK) (
 	if err != nil {
 		return domain.DEK{}, err
 	}
+
+	lock := k.lockFor(wrapped.KEKID)
+	lock.RLock()
+	defer lock.RUnlock()
 
 	res, err := k.call(ctx, http.MethodPost, "decrypt/"+keyName(wrapped.KEKID),
 		&transitRequest{Ciphertext: ciphertext, Context: []byte(wrapped.KeyID)})
@@ -512,6 +537,10 @@ func (k *KeyManager) RewrapDEK(ctx context.Context, wrapped domain.WrappedDEK) (
 		return domain.WrappedDEK{}, err
 	}
 
+	lock := k.lockFor(wrapped.KEKID)
+	lock.RLock()
+	defer lock.RUnlock()
+
 	res, err := k.call(ctx, http.MethodPost, "rewrap/"+keyName(wrapped.KEKID),
 		&transitRequest{Ciphertext: ciphertext, Context: []byte(wrapped.KeyID)})
 	if err != nil {
@@ -538,6 +567,10 @@ func (k *KeyManager) RotateKEK(ctx context.Context, kekID domain.KEKID) (domain.
 	if err := kekID.Validate(); err != nil {
 		return 0, err
 	}
+
+	lock := k.lockFor(kekID)
+	lock.Lock()
+	defer lock.Unlock()
 
 	res, err := k.callNoRetry(ctx, http.MethodPost, "keys/"+keyName(kekID)+"/rotate", &transitRequest{})
 	if err != nil {
@@ -608,6 +641,10 @@ func (k *KeyManager) DestroyKEK(ctx context.Context, kekID domain.KEKID) error {
 	if err := kekID.Validate(); err != nil {
 		return err
 	}
+
+	lock := k.lockFor(kekID)
+	lock.Lock()
+	defer lock.Unlock()
 
 	key, err := k.readKey(ctx, keyName(kekID))
 	if err != nil {

@@ -56,6 +56,12 @@ release may break the API. See `UPGRADING.md` for migration steps.
   `Retry-After`; `RotateKEK` is never retried automatically because a lost
   response may have created a version.
 
+- Adapter operations now take a per-KEK lock: a destroy cannot interleave
+  with an in-flight wrap or read in the same process, and a post-destroy wrap
+  sees the tombstone instead of resurrecting a key. Cross-process ordering
+  still relies on the backend/store transactions and is documented in
+  `SECURITY.md`.
+
 ### Security and correctness
 
 - OpenBao redirects are refused, preventing `X-Vault-Token` and plaintext DEKs

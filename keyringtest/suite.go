@@ -44,6 +44,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/laenenai/keyring"
 )
@@ -1218,38 +1219,72 @@ func RunKeyManagerSuite(t *testing.T, newKM func(t *testing.T) keyring.KeyManage
 		ctx := context.Background()
 		kekID := newKEKID(t)
 
+		// Create the KEK before the barrier so the rotation below is a
+		// rotation, not a race with first creation.
+		if _, err := km.WrapDEK(ctx, kekID, newKeyID(t), newDEK(t)); err != nil {
+			t.Fatalf("warm-up WrapDEK: %v", err)
+		}
+
 		const goroutines = 8
+		start := make(chan struct{})
 		var wg sync.WaitGroup
 		errs := make([]error, 2*goroutines)
 		for i := range goroutines {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
+				<-start
 				errs[i] = wrapUnwrapOnce(ctx, km, kekID, keyring.KeyID(fmt.Sprintf("concurrent-%d", i)))
 			}()
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
+				<-start
 				errs[goroutines+i] = generateRewrapUnwrapOnce(ctx, km, kekID, keyring.KeyID(fmt.Sprintf("concurrent-generated-%d", i)))
 			}()
 		}
 		// A rotation in flight: wraps that land either side of it record
-		// different versions, and every record must still unwrap.
+		// different versions, and every record must still unwrap. Transient
+		// backend conflicts are retried here; permanent failures are not.
+		rotateDone := make(chan error, 1)
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if _, err := km.RotateKEK(ctx, kekID); err != nil && !errors.Is(err, keyring.ErrKEKNotFound) {
-				t.Errorf("concurrent RotateKEK: %v", err)
+			<-start
+			version, err := rotateEventually(ctx, km, kekID)
+			if err == nil && version < keyring.KEKVersion(2) {
+				err = fmt.Errorf("rotation returned %s, want at least v2", version)
 			}
+			rotateDone <- err
 		}()
+		close(start)
 		wg.Wait()
 
+		if err := <-rotateDone; err != nil {
+			t.Errorf("concurrent RotateKEK: %v", err)
+		}
 		for i, err := range errs {
 			if err != nil {
 				t.Errorf("goroutine %d: %v", i, err)
 			}
 		}
 	})
+}
+
+func rotateEventually(ctx context.Context, km keyring.KeyManager, kekID keyring.KEKID) (keyring.KEKVersion, error) {
+	var last error
+	for attempt := range 3 {
+		version, err := km.RotateKEK(ctx, kekID)
+		if err == nil {
+			return version, nil
+		}
+		last = err
+		if !errors.Is(err, keyring.ErrTransient) {
+			return 0, err
+		}
+		time.Sleep(time.Duration(attempt+1) * 10 * time.Millisecond)
+	}
+	return 0, last
 }
 
 // wrapUnwrapOnce mints a DEK, wraps it, unwraps it and checks the round
