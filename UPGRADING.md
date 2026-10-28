@@ -57,7 +57,26 @@ serializer relied on reading the exported `RootKey`/`Token` fields, it must
 use the redacted representation instead. `%p` remains a known exception; see
 `CONVENTIONS.md`.
 
-### 6. Move store imports to the neutral package
+### 6. Handle typed OpenBao failures and retry policy
+
+OpenBao calls now classify permanent and transient failures:
+
+```go
+switch {
+case errors.Is(err, keyring.ErrPermissionDenied):
+    // Fix the token policy; retrying will not help.
+case errors.Is(err, keyring.ErrRateLimited), errors.Is(err, keyring.ErrTransient):
+    // Safe to retry within your own budget; the adapter also retries
+    // bounded transient failures for non-ambiguous operations.
+}
+```
+
+`openbaotransit.Config.Retry` controls attempts/backoff; the zero value is
+three attempts with jittered exponential backoff. `RotateKEK` is deliberately
+not retried automatically: a lost response may already have created a new
+version. Retry it yourself only if an extra version is acceptable.
+
+### 7. Move store imports to the neutral package
 
 The persistence port now lives in `keymanager/kekstore`:
 
@@ -73,7 +92,7 @@ store := kekstore.NewMemKEKStore() // tests only
 `keyringtest.RunKEKStoreSuite` now accepts `kekstore.KEKStore`; callers passing
 a `local.KEKStore` function value need no change because the type is an alias.
 
-### 7. Persist records with the versioned format
+### 8. Persist records with the versioned format
 
 New wrapped records carry `Format`. JSON field names are now stable
 (`kek_id`, `kek_version`, `key_id`, `format`, `ciphertext`); if you stored the
@@ -83,7 +102,7 @@ old Go field names, migrate the values or decode both shapes. Prefer
 rejects a record whose non-empty format belongs to another adapter with
 `ErrInvalidWrappedDEK`.
 
-### 8. Use the optional rewrap capability
+### 9. Use the optional rewrap capability
 
 If a rotation worker requires that the DEK never enters its process, assert
 `keyring.RewrapWithoutPlaintext` on the manager and use
@@ -91,7 +110,7 @@ If a rotation worker requires that the DEK never enters its process, assert
 local adapter does not. `RewrapDEK` keeps its existing semantics and remains
 the portable method.
 
-### 9. Install the Postgres companion module
+### 10. Install the Postgres companion module
 
 The durable store is no longer part of the root module:
 
@@ -110,7 +129,7 @@ The first release is `postgres/v0.1.0`; it requires root keyring v0.3.0.
 Run this module's schema migration before serving traffic. The root module
 still has no database dependency.
 
-### 10. Replace the API golden-file workflow
+### 11. Replace the API golden-file workflow
 
 The API golden file and its regeneration task are gone. Use:
 

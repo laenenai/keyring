@@ -70,6 +70,23 @@ var (
 	// add that detail to the wrapped message either.
 	ErrUnwrapFailed = errors.New("keyring: unwrap failed")
 
+	// ErrPermissionDenied is returned when a backend rejects the
+	// credentials or policy for an otherwise valid request. It is
+	// permanent until the deployment's access is fixed, so adapters do not
+	// retry it.
+	ErrPermissionDenied = errors.New("keyring: permission denied")
+
+	// ErrRateLimited is returned when a backend asks the caller to slow
+	// down. Adapters may retry it with their bounded policy; callers can
+	// use errors.Is to distinguish it from a permanent failure.
+	ErrRateLimited = errors.New("keyring: rate limited")
+
+	// ErrTransient is returned when a backend failed in a way that may
+	// succeed on retry: a 5xx response or a transport error. A mutation
+	// that is not safe to repeat (RotateKEK) still reports this error
+	// without an automatic retry, so the caller can decide.
+	ErrTransient = errors.New("keyring: transient backend error")
+
 	// ErrInvalidConfig is returned by an adapter's Open when its
 	// configuration cannot produce a working key manager: no root key, a
 	// root key that is too short, both a key and a key file given, an

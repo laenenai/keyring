@@ -50,6 +50,12 @@ release may break the API. See `UPGRADING.md` for migration steps.
   It is a separately versioned companion module, applies its schema with
   `Migrate`, and runs the full `kekstore` conformance suite against Postgres.
 
+- **OpenBao failures are typed and transient errors are retried.** 5xx and
+  transport failures surface as `ErrTransient`, 429 as `ErrRateLimited`, and
+  401/403 as `ErrPermissionDenied`. `Config.Retry` bounds attempts, backoff and
+  `Retry-After`; `RotateKEK` is never retried automatically because a lost
+  response may have created a version.
+
 ### Security and correctness
 
 - OpenBao redirects are refused, preventing `X-Vault-Token` and plaintext DEKs

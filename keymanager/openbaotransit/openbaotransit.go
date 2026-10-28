@@ -86,6 +86,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/url"
@@ -163,6 +164,40 @@ type Config struct {
 	// the client and replaces CheckRedirect so a redirect cannot forward
 	// the X-Vault-Token header or a plaintext DEK to another origin.
 	HTTPClient *http.Client
+
+	// Retry controls bounded retries for transport errors, 429 and 5xx
+	// responses. The zero value uses DefaultRetryPolicy; set MaxAttempts
+	// to 1 to disable automatic retries. RotateKEK is never retried
+	// automatically because a lost response may have created a version.
+	Retry RetryPolicy
+}
+
+// RetryPolicy bounds automatic retries. MaxAttempts counts the first
+// attempt; 1 means no retries.
+type RetryPolicy struct {
+	MaxAttempts    int
+	InitialBackoff time.Duration
+	MaxBackoff     time.Duration
+}
+
+// DefaultRetryPolicy is used when Config.Retry is the zero value.
+var DefaultRetryPolicy = RetryPolicy{
+	MaxAttempts:    3,
+	InitialBackoff: 100 * time.Millisecond,
+	MaxBackoff:     2 * time.Second,
+}
+
+func (p RetryPolicy) normalized() RetryPolicy {
+	if p.MaxAttempts < 1 {
+		p.MaxAttempts = DefaultRetryPolicy.MaxAttempts
+	}
+	if p.InitialBackoff <= 0 {
+		p.InitialBackoff = DefaultRetryPolicy.InitialBackoff
+	}
+	if p.MaxBackoff < p.InitialBackoff {
+		p.MaxBackoff = p.InitialBackoff
+	}
+	return p
 }
 
 // String renders the configuration with the token redacted.
@@ -228,6 +263,8 @@ type KeyManager struct {
 	token string
 	// client performs every request.
 	client *http.Client
+	// retry bounds transient retries.
+	retry RetryPolicy
 }
 
 // Open validates cfg and returns a key manager over it.
@@ -298,6 +335,7 @@ func Open(ctx context.Context, cfg Config) (*KeyManager, error) {
 		mount:  mount,
 		token:  cfg.Token,
 		client: client,
+		retry:  cfg.Retry.normalized(),
 	}, nil
 }
 
@@ -501,7 +539,7 @@ func (k *KeyManager) RotateKEK(ctx context.Context, kekID domain.KEKID) (domain.
 		return 0, err
 	}
 
-	res, err := k.call(ctx, http.MethodPost, "keys/"+keyName(kekID)+"/rotate", &transitRequest{})
+	res, err := k.callNoRetry(ctx, http.MethodPost, "keys/"+keyName(kekID)+"/rotate", &transitRequest{})
 	if err != nil {
 		return 0, k.classify(ctx, kekID, "rotate", err)
 	}
@@ -775,7 +813,134 @@ func (k *KeyManager) readKey(ctx context.Context, name string) (*transitResponse
 	return res, nil
 }
 
-// call performs one transit request and decodes its response.
+// call performs one transit request and decodes its response, retrying
+// transient failures under the configured policy.
+func (k *KeyManager) call(ctx context.Context, method, path string, body *transitRequest) (*transitResponse, error) {
+	return k.callWithRetry(ctx, method, path, body, true)
+}
+
+// callNoRetry performs one request with no automatic retry. RotateKEK uses
+// it because a lost response may mean the server created a version; a caller
+// can still retry after receiving ErrTransient.
+func (k *KeyManager) callNoRetry(ctx context.Context, method, path string, body *transitRequest) (*transitResponse, error) {
+	return k.callWithRetry(ctx, method, path, body, false)
+}
+
+func (k *KeyManager) callWithRetry(ctx context.Context, method, path string, body *transitRequest, retry bool) (*transitResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	var encoded []byte
+	if body != nil {
+		var err error
+		encoded, err = json.Marshal(body)
+		if err != nil {
+			// Deliberately rendered without the body: a marshalling failure
+			// on a request carrying a DEK must not print the request.
+			return nil, fmt.Errorf("keyring/openbaotransit: encode a %s request: %w", method, err)
+		}
+		defer clear(encoded)
+	}
+
+	attempts := 1
+	if retry {
+		attempts = k.retry.MaxAttempts
+	}
+	var lastErr error
+	for attempt := 0; attempt < attempts; attempt++ {
+		res, err := k.callOnce(ctx, method, path, encoded)
+		if err == nil {
+			return res, nil
+		}
+		lastErr = err
+		if !retry || !isRetryable(err) || attempt == attempts-1 || ctx.Err() != nil {
+			break
+		}
+		if err := waitForRetry(ctx, k.retryDelay(attempt, err)); err != nil {
+			return nil, err
+		}
+	}
+	return nil, classifyCallError(lastErr)
+}
+
+func (k *KeyManager) retryDelay(attempt int, err error) time.Duration {
+	delay := k.retry.InitialBackoff
+	for range attempt {
+		if delay >= k.retry.MaxBackoff/2 {
+			delay = k.retry.MaxBackoff
+			break
+		}
+		delay *= 2
+	}
+	if retryAfter := retryAfterOf(err); retryAfter > 0 {
+		delay = retryAfter
+	}
+	if delay > k.retry.MaxBackoff {
+		delay = k.retry.MaxBackoff
+	}
+	// Jitter prevents a fleet of clients from retrying in lockstep. Keep it
+	// within the configured cap; tests use tiny backoffs.
+	if delay > 0 {
+		delay += time.Duration(rand.Int64N(int64(delay)/4 + 1)) //nolint:gosec // jitter is not security-sensitive
+	}
+	return delay
+}
+
+func waitForRetry(ctx context.Context, delay time.Duration) error {
+	if delay <= 0 {
+		return ctx.Err()
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func isRetryable(err error) bool {
+	var transport *transportError
+	if errors.As(err, &transport) {
+		return true
+	}
+	var apiErr *apiError
+	if errors.As(err, &apiErr) {
+		return apiErr.status == http.StatusTooManyRequests || apiErr.status >= 500
+	}
+	return false
+}
+
+func retryAfterOf(err error) time.Duration {
+	var retryAfter interface{ RetryAfter() time.Duration }
+	if errors.As(err, &retryAfter) {
+		return retryAfter.RetryAfter()
+	}
+	return 0
+}
+
+func classifyCallError(err error) error {
+	var transport *transportError
+	if errors.As(err, &transport) {
+		return fmt.Errorf("%w: %w", domain.ErrTransient, err)
+	}
+	var apiErr *apiError
+	if errors.As(err, &apiErr) {
+		switch {
+		case apiErr.status == http.StatusTooManyRequests:
+			return fmt.Errorf("%w: %w", domain.ErrRateLimited, err)
+		case apiErr.status == http.StatusUnauthorized || apiErr.status == http.StatusForbidden:
+			return fmt.Errorf("%w: %w", domain.ErrPermissionDenied, err)
+		case apiErr.status >= 500:
+			return fmt.Errorf("%w: %w", domain.ErrTransient, err)
+		}
+	}
+	return err
+}
+
+// callOnce performs one transit request and decodes its response.
 //
 // The request and response buffers are this package's own and are zeroized
 // before returning, so the base64 of a DEK does not sit in a heap buffer
@@ -783,20 +948,9 @@ func (k *KeyManager) readKey(ctx context.Context, name string) (*transitResponse
 // base64-decodes from the response bytes directly — rather than into a string
 // is deliberate for the same reason: a Go string holding key material cannot
 // be cleared.
-func (k *KeyManager) call(ctx context.Context, method, path string, body *transitRequest) (*transitResponse, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-
+func (k *KeyManager) callOnce(ctx context.Context, method, path string, encoded []byte) (*transitResponse, error) {
 	var reader io.Reader
-	if body != nil {
-		encoded, err := json.Marshal(body)
-		if err != nil {
-			// Deliberately rendered without the body: a marshalling failure
-			// on a request carrying a DEK must not print the request.
-			return nil, fmt.Errorf("keyring/openbaotransit: encode a %s request: %w", method, err)
-		}
-		defer clear(encoded)
+	if encoded != nil {
 		reader = bytes.NewReader(encoded)
 	}
 
@@ -805,7 +959,7 @@ func (k *KeyManager) call(ctx context.Context, method, path string, body *transi
 		return nil, fmt.Errorf("keyring/openbaotransit: build a %s request: %w", method, err)
 	}
 	req.Header.Set("X-Vault-Token", k.token)
-	if body != nil {
+	if encoded != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
 
@@ -813,13 +967,13 @@ func (k *KeyManager) call(ctx context.Context, method, path string, body *transi
 	if err != nil {
 		// A *url.Error wraps the context's error, so errors.Is sees a
 		// cancellation or a deadline through this.
-		return nil, fmt.Errorf("keyring/openbaotransit: %s: %w", method, err)
+		return nil, &transportError{err: fmt.Errorf("keyring/openbaotransit: %s: %w", method, err)}
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
 	if err != nil {
-		return nil, fmt.Errorf("keyring/openbaotransit: read the response to %s: %w", method, err)
+		return nil, &transportError{err: fmt.Errorf("keyring/openbaotransit: read the response to %s: %w", method, err)}
 	}
 	defer clear(raw)
 
@@ -830,15 +984,42 @@ func (k *KeyManager) call(ctx context.Context, method, path string, body *transi
 			if !ok {
 				// A non-2xx whose body is not the usual JSON: a proxy, or a
 				// server that is not OpenBao. The status is all there is.
-				return nil, &apiError{status: resp.StatusCode}
+				return nil, &apiError{status: resp.StatusCode, retryAfter: parseRetryAfter(resp.Header.Get("Retry-After"))}
 			}
 			return nil, fmt.Errorf("keyring/openbaotransit: decode the response to %s: %w", method, err)
 		}
 	}
 	if !ok {
-		return nil, &apiError{status: resp.StatusCode, messages: decoded.Errors}
+		return nil, &apiError{
+			status:     resp.StatusCode,
+			messages:   decoded.Errors,
+			retryAfter: parseRetryAfter(resp.Header.Get("Retry-After")),
+		}
 	}
 	return &decoded, nil
+}
+
+// transportError marks a failure before a usable HTTP response arrived, or
+// while reading one, so it can be retried without treating a malformed 2xx
+// body as a transient network fault.
+type transportError struct{ err error }
+
+func (e *transportError) Error() string { return e.err.Error() }
+func (e *transportError) Unwrap() error { return e.err }
+
+func parseRetryAfter(value string) time.Duration {
+	if value == "" {
+		return 0
+	}
+	if seconds, err := strconv.Atoi(value); err == nil && seconds >= 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	if at, err := http.ParseTime(value); err == nil {
+		if delay := time.Until(at); delay > 0 {
+			return delay
+		}
+	}
+	return 0
 }
 
 // transitRequest is the union of the fields this adapter sends. Every field is
@@ -877,9 +1058,14 @@ type transitResponse struct {
 // that contained a DEK cannot be rendered through it, and it never carries
 // the token.
 type apiError struct {
-	status   int
-	messages []string
+	status     int
+	messages   []string
+	retryAfter time.Duration
 }
+
+// RetryAfter reports the delay the server asked for in Retry-After, when it
+// supplied one.
+func (e *apiError) RetryAfter() time.Duration { return e.retryAfter }
 
 // Error renders the status and the server's messages.
 func (e *apiError) Error() string {

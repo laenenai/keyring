@@ -111,6 +111,12 @@ var (
 	ErrUnwrapFailed = domain.ErrUnwrapFailed
 	// ErrInvalidConfig is domain.ErrInvalidConfig.
 	ErrInvalidConfig = domain.ErrInvalidConfig
+	// ErrPermissionDenied is domain.ErrPermissionDenied.
+	ErrPermissionDenied = domain.ErrPermissionDenied
+	// ErrRateLimited is domain.ErrRateLimited.
+	ErrRateLimited = domain.ErrRateLimited
+	// ErrTransient is domain.ErrTransient.
+	ErrTransient = domain.ErrTransient
 )
 
 // NewDEK returns a fresh DEK read from crypto/rand. See domain.NewDEK.
