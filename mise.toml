@@ -40,7 +40,7 @@ run = "go test ./... -short -count=1 && (cd postgres && go test ./... -short -co
 
 [tasks.build]
 description = "Proves the shipped binary is cgo-free: inherits CGO_ENABLED=0 from [env]."
-run = "go build ./..."
+run = "go build ./... && (cd postgres && go build ./...)"
 
 [tasks.test-all]
 description = "Full suite including container- and database-backed tests."

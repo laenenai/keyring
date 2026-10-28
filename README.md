@@ -90,7 +90,15 @@ root key in-process, while transit keeps it outside.
   lazy re-wrapping rather than re-encrypting content.
 - `RewrapDEK` moves a record to the current KEK version **without decrypting
   it** on the transit adapter — the plaintext key never enters this process.
-  It is a first-class operation, not unwrap-then-wrap.
+  It is a first-class operation, not unwrap-then-wrap; callers that require
+  that property can assert the optional `keyring.RewrapWithoutPlaintext`.
+- Wrapped records carry an adapter format and a versioned binary encoding, so
+  a mixed store can reject the wrong adapter and old records remain readable.
+- OpenBao transport errors are classified as `ErrTransient`, `ErrRateLimited`
+  or `ErrPermissionDenied`; transient failures are retried within
+  `Config.Retry`, except for `RotateKEK`.
+- Both adapters implement the optional `keyring.Closer`, which zeroizes the
+  local wrapping key or clears the transit token and idle connections.
 - A `DEK` is zeroizable and redacted through the controllable rendering paths:
   `Format` (which covers every `fmt` verb except the documented `%p`/`%T`
   holes), `String`, `GoString`, `MarshalText`, `MarshalJSON` and
@@ -144,7 +152,8 @@ Tool versions are pinned in `mise.toml`; CI uses the same file via
 ## Documentation
 
 - [`CHARTER.md`](CHARTER.md) — the boundary and the two mechanisms that enforce it
-- [`SECURITY.md`](SECURITY.md) — reporting, and what the conformance suite does and does not prove
+- [`SECURITY.md`](SECURITY.md) — threat model, reporting, and what the conformance suite proves
+- [`docs/architecture.md`](docs/architecture.md) — key hierarchy, record formats, lifecycle and failure modes
 - [`CONVENTIONS.md`](CONVENTIONS.md) — the shared Go and redaction conventions
 - [`CHANGELOG.md`](CHANGELOG.md) — human-readable release notes
 - [`UPGRADING.md`](UPGRADING.md) — migration steps for breaking changes

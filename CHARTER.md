@@ -1,6 +1,6 @@
 # Charter: `keyring`
 
-**It does this one thing:** Envelope encryption with WrapDEK / GenerateDEK / UnwrapDEK / RewrapDEK / RotateKEK / DestroyKEK, with local and openbao-transit adapters. The root key is outside the process only with transit; the local adapter keeps it in-process and requires a durable `KEKStore` for persisted content. External-KMS adapters are out of the public surface until a real transport exists.
+**It does this one thing:** Envelope encryption with WrapDEK / GenerateDEK / UnwrapDEK / RewrapDEK / RotateKEK / DestroyKEK, with local and openbao-transit adapters. The root key is outside the process only with transit; the local adapter keeps it in-process and requires a durable `KEKStore` for persisted content; the Postgres reference store lives in the separately versioned `keyring/postgres` companion module. External-KMS adapters are out of the public surface until a real transport exists.
 
 **It must not contain:** What is being encrypted. Shredding policy. Any domain concept. (cas/internal/crypto is a blob stream cipher and stays in cas.)
 

@@ -37,13 +37,20 @@ inside OpenBao; and failure of the deployment to supply a durable `KEKStore`.
 
 ## Crypto-shredding
 
-`DestroyKEK` is intended to be linearizable in the live system: after it
-returns, operations naming that KEK fail rather than returning a DEK. Backups,
-snapshots, object-store versions and the root key are **not** erased by
-`DestroyKEK`; a restore of the wrapped KEK plus the root key can recover it.
-The implementation is being hardened against the destroy/wrap race and
-tombstone-present/key-present states; do not treat an erasure certificate as
+`DestroyKEK` is linearizable within one adapter instance: a per-KEK lock makes
+an in-flight wrap finish before destruction, and a wrap that starts after
+destruction sees the tombstone. Across processes, the adapter re-checks the
+tombstone after the server mutates and deletes a key recreated by transit's
+upsert; a wrap that wins the race can still return a record, but it is
+unwrappable after destruction. Backups, snapshots, object-store versions and
+the root key are **not** erased by `DestroyKEK`; a restore of the wrapped KEK
+plus the root key can recover it. Do not treat an erasure certificate as
 covering backups.
+
+The OpenBao tombstone is a transit key. A token with write access to the
+adapter's mount can forge one, so split the destroy/administrative token from
+the runtime wrap/unwrap token and keep the mount private. A compromised
+OpenBao server is outside the threat model; tombstones are not server-signed.
 
 ## What the conformance suite proves, and what it does not
 
@@ -58,3 +65,13 @@ manager's access policy, an operator's privilege separation, a backup's
 deletion policy, or TLS configuration. Those are verified by integration tests
 against the real dependency where one exists, and are otherwise the
 deployment's responsibility.
+
+The Postgres companion module is tested against a real Postgres container
+through `keyringtest.RunKEKStoreSuite`. It stores only wrapped KEK material;
+the root key must not be placed in the database. The store's threat model is
+the same as the local adapter: a stolen database backup is useless without the
+root key, but a compromised application process is out of scope.
+
+OpenBao 2.2.x is the tested server version. The wire format also accepts
+Vault-style ciphertext prefixes, but a Vault server matrix is not run; treat
+Vault compatibility as untested until that matrix exists.
