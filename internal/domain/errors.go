@@ -87,6 +87,11 @@ var (
 	// without an automatic retry, so the caller can decide.
 	ErrTransient = errors.New("keyring: transient backend error")
 
+	// ErrClosed is returned after an adapter's Close has released its
+	// secrets and connections. Further operations are refused instead of
+	// using zeroized material.
+	ErrClosed = errors.New("keyring: key manager closed")
+
 	// ErrInvalidConfig is returned by an adapter's Open when its
 	// configuration cannot produce a working key manager: no root key, a
 	// root key that is too short, both a key and a key file given, an

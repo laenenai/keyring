@@ -94,6 +94,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/laenenai/keyring/internal/domain"
@@ -171,6 +172,10 @@ type Config struct {
 	// to 1 to disable automatic retries. RotateKEK is never retried
 	// automatically because a lost response may have created a version.
 	Retry RetryPolicy
+
+	// Logger, when set, receives lifecycle events. It never receives the
+	// token, key material or request bodies.
+	Logger *slog.Logger
 }
 
 // RetryPolicy bounds automatic retries. MaxAttempts counts the first
@@ -270,6 +275,12 @@ type KeyManager struct {
 	// lock; rotation and destruction hold the write lock, so a destroy
 	// cannot interleave with an in-flight wrap inside this adapter instance.
 	locks *sync.Map // domain.KEKID -> *sync.RWMutex
+	// logger receives lifecycle events; nil means silent.
+	logger *slog.Logger
+	// closed is shared by copies of the manager so Close cannot be undone
+	// by a value copy.
+	closed    *atomic.Bool
+	closeOnce *sync.Once
 }
 
 func (k *KeyManager) lockFor(id domain.KEKID) *sync.RWMutex {
@@ -341,13 +352,38 @@ func Open(ctx context.Context, cfg Config) (*KeyManager, error) {
 	client = &clone
 
 	return &KeyManager{
-		base:   strings.TrimSuffix(parsed.String(), "/"),
-		mount:  mount,
-		token:  cfg.Token,
-		client: client,
-		retry:  cfg.Retry.normalized(),
-		locks:  &sync.Map{},
+		base:      strings.TrimSuffix(parsed.String(), "/"),
+		mount:     mount,
+		token:     cfg.Token,
+		client:    client,
+		retry:     cfg.Retry.normalized(),
+		locks:     &sync.Map{},
+		logger:    cfg.Logger,
+		closed:    &atomic.Bool{},
+		closeOnce: &sync.Once{},
 	}, nil
+}
+
+// Close releases the token and idle HTTP connections. It is idempotent.
+// Operations that start after Close return domain.ErrClosed; Close must not
+// race an in-flight operation.
+func (k *KeyManager) Close() error {
+	k.closeOnce.Do(func() {
+		k.closed.Store(true)
+		k.token = ""
+		k.client.CloseIdleConnections()
+		if k.logger != nil {
+			k.logger.Info("keyring: OpenBao transit key manager closed")
+		}
+	})
+	return nil
+}
+
+func (k *KeyManager) checkOpen() error {
+	if k.closed != nil && k.closed.Load() {
+		return domain.ErrClosed
+	}
+	return nil
 }
 
 // refuseRedirect is installed on every client. http.ErrUseLastResponse makes
@@ -865,6 +901,9 @@ func (k *KeyManager) callNoRetry(ctx context.Context, method, path string, body 
 
 func (k *KeyManager) callWithRetry(ctx context.Context, method, path string, body *transitRequest, retry bool) (*transitResponse, error) {
 	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := k.checkOpen(); err != nil {
 		return nil, err
 	}
 

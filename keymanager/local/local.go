@@ -58,6 +58,7 @@ import (
 	"log/slog"
 	"os"
 	"sync"
+	"sync/atomic"
 
 	"github.com/laenenai/keyring/internal/domain"
 )
@@ -147,6 +148,10 @@ type Config struct {
 	// of every encrypted byte — see MemKEKStore, which a test or a
 	// deliberately ephemeral process can pass explicitly.
 	Store KEKStore
+
+	// Logger, when set, receives lifecycle events. It never receives key
+	// material, wrapped records, or the root-key path.
+	Logger *slog.Logger
 }
 
 // String renders the configuration with the deployment root key redacted,
@@ -233,6 +238,13 @@ type keyManagerState struct {
 	// store holds wrapped KEK material and destruction records.
 	store KEKStore
 
+	// logger receives lifecycle events; nil means silent.
+	logger *slog.Logger
+
+	// closed is set by Close before the wrapping key is zeroized.
+	closed    atomic.Bool
+	closeOnce sync.Once
+
 	// mu serializes the operations that create KEK versions — the implicit
 	// creation inside WrapDEK and RotateKEK — so that two goroutines in
 	// this process cannot both decide they are creating the same version.
@@ -280,13 +292,40 @@ func Open(ctx context.Context, cfg Config) (*KeyManager, error) {
 	if err != nil {
 		return nil, fmt.Errorf("keyring/local: derive the KEK wrapping key: %w", err)
 	}
-	return &KeyManager{state: &keyManagerState{wrapKey: wrapKey, store: cfg.Store}}, nil
+	return &KeyManager{state: &keyManagerState{wrapKey: wrapKey, store: cfg.Store, logger: cfg.Logger}}, nil
+}
+
+// Close zeroizes the derived wrapping key. It is idempotent. Operations that
+// start after Close return domain.ErrClosed; Close must not race an in-flight
+// operation.
+func (k *KeyManager) Close() error {
+	k.state.closeOnce.Do(func() {
+		k.state.closed.Store(true)
+		k.state.mu.Lock()
+		clear(k.state.wrapKey)
+		k.state.wrapKey = nil
+		k.state.mu.Unlock()
+		if k.state.logger != nil {
+			k.state.logger.Info("keyring: local key manager closed")
+		}
+	})
+	return nil
+}
+
+func (k *KeyManager) checkOpen() error {
+	if k.state.closed.Load() {
+		return domain.ErrClosed
+	}
+	return nil
 }
 
 // WrapDEK implements keymanager.KeyManager.
 func (k *KeyManager) WrapDEK(ctx context.Context, kekID domain.KEKID, keyID domain.KeyID, dek domain.DEK) (domain.WrappedDEK, error) {
 	if err := ctx.Err(); err != nil {
 		return domain.WrappedDEK{}, fmt.Errorf("keyring/local: wrap DEK: %w", err)
+	}
+	if err := k.checkOpen(); err != nil {
+		return domain.WrappedDEK{}, err
 	}
 	if err := kekID.Validate(); err != nil {
 		return domain.WrappedDEK{}, err
@@ -338,6 +377,9 @@ func (k *KeyManager) GenerateDEK(ctx context.Context, kekID domain.KEKID, keyID 
 	if err := ctx.Err(); err != nil {
 		return domain.DEK{}, domain.WrappedDEK{}, fmt.Errorf("keyring/local: generate DEK: %w", err)
 	}
+	if err := k.checkOpen(); err != nil {
+		return domain.DEK{}, domain.WrappedDEK{}, err
+	}
 	// Validate before drawing entropy, so a caller's typo does not consume
 	// randomness and so the error is the same one WrapDEK would have given.
 	if err := kekID.Validate(); err != nil {
@@ -365,6 +407,9 @@ func (k *KeyManager) GenerateDEK(ctx context.Context, kekID domain.KEKID, keyID 
 func (k *KeyManager) UnwrapDEK(ctx context.Context, wrapped domain.WrappedDEK) (domain.DEK, error) {
 	if err := ctx.Err(); err != nil {
 		return domain.DEK{}, fmt.Errorf("keyring/local: unwrap DEK: %w", err)
+	}
+	if err := k.checkOpen(); err != nil {
+		return domain.DEK{}, err
 	}
 	if err := wrapped.Validate(); err != nil {
 		return domain.DEK{}, err
@@ -418,6 +463,9 @@ func (k *KeyManager) UnwrapDEK(ctx context.Context, wrapped domain.WrappedDEK) (
 func (k *KeyManager) RewrapDEK(ctx context.Context, wrapped domain.WrappedDEK) (domain.WrappedDEK, error) {
 	if err := ctx.Err(); err != nil {
 		return domain.WrappedDEK{}, fmt.Errorf("keyring/local: rewrap DEK: %w", err)
+	}
+	if err := k.checkOpen(); err != nil {
+		return domain.WrappedDEK{}, err
 	}
 	if err := wrapped.Validate(); err != nil {
 		return domain.WrappedDEK{}, err
@@ -486,6 +534,9 @@ func (k *KeyManager) RotateKEK(ctx context.Context, kekID domain.KEKID) (domain.
 	if err := ctx.Err(); err != nil {
 		return 0, fmt.Errorf("keyring/local: rotate KEK: %w", err)
 	}
+	if err := k.checkOpen(); err != nil {
+		return 0, err
+	}
 	if err := kekID.Validate(); err != nil {
 		return 0, err
 	}
@@ -526,6 +577,9 @@ func (k *KeyManager) RotateKEK(ctx context.Context, kekID domain.KEKID) (domain.
 func (k *KeyManager) DestroyKEK(ctx context.Context, kekID domain.KEKID) error {
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("keyring/local: destroy KEK: %w", err)
+	}
+	if err := k.checkOpen(); err != nil {
+		return err
 	}
 	if err := kekID.Validate(); err != nil {
 		return err

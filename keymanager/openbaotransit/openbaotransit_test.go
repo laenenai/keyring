@@ -760,3 +760,22 @@ func TestWrongAdapterFormatIsRejectedWithoutTheServer(t *testing.T) {
 		t.Fatalf("RewrapDEK(wrong format) = %v, want ErrInvalidWrappedDEK", err)
 	}
 }
+
+func TestCloseRejectsFurtherUseAndIsIdempotent(t *testing.T) {
+	t.Parallel()
+
+	km := unreachableKeyManager(t)
+	closer, ok := km.(interface{ Close() error })
+	if !ok {
+		t.Fatal("openbaotransit.KeyManager does not implement Close")
+	}
+	if err := closer.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := closer.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+	if _, err := km.RotateKEK(context.Background(), "kek-closed"); !errors.Is(err, keyring.ErrClosed) {
+		t.Fatalf("RotateKEK after Close = %v, want ErrClosed", err)
+	}
+}

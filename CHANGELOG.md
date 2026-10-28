@@ -73,6 +73,12 @@ release may break the API. See `UPGRADING.md` for migration steps.
   no longer includes the key path in errors.
 - Config XML/gob serialization is redacted for both adapters.
 
+- Adapters implement the optional `keyring.Closer`: `Close` zeroizes the
+  local wrapping key, clears the transit token and closes idle connections.
+  Both adapters accept an optional `*slog.Logger` for lifecycle events.
+- The local adapter has a committed v1 wire-format fixture and both record
+  parsers have fuzz targets; the binary `WrappedDEK` decoder has one too.
+
 ### Tooling and docs
 
 - `mise run check` now includes `generate-check`, `vuln` and `api-diff`.

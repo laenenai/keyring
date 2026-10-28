@@ -661,3 +661,27 @@ func TestDestroyWaitsForInFlightWrap(t *testing.T) {
 		t.Fatalf("UnwrapDEK after destroy = %v, want ErrKEKDestroyed", err)
 	}
 }
+
+func TestCloseRejectsFurtherUseAndIsIdempotent(t *testing.T) {
+	t.Parallel()
+
+	km := newKeyManager(t, randomRootKey(t), local.NewMemKEKStore())
+	closer, ok := km.(interface{ Close() error })
+	if !ok {
+		t.Fatal("local.KeyManager does not implement Close")
+	}
+	if err := closer.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := closer.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+	dek, err := keyring.NewDEK()
+	if err != nil {
+		t.Fatalf("NewDEK: %v", err)
+	}
+	t.Cleanup(dek.Destroy)
+	if _, err := km.WrapDEK(context.Background(), "kek-closed", "key-1", dek); !errors.Is(err, keyring.ErrClosed) {
+		t.Fatalf("WrapDEK after Close = %v, want ErrClosed", err)
+	}
+}

@@ -51,6 +51,8 @@ type (
 	// keymanager.KeyManager, and keymanager.RunKeyManagerSuite for the
 	// authoritative contract.
 	KeyManager = keymanager.KeyManager
+	// Closer is the optional lifecycle interface. See keymanager.Closer.
+	Closer = keymanager.Closer
 	// RewrapWithoutPlaintext is the optional capability for adapters whose
 	// RewrapDEK never puts the DEK in this process. See
 	// keymanager.RewrapWithoutPlaintext.
@@ -111,6 +113,8 @@ var (
 	ErrUnwrapFailed = domain.ErrUnwrapFailed
 	// ErrInvalidConfig is domain.ErrInvalidConfig.
 	ErrInvalidConfig = domain.ErrInvalidConfig
+	// ErrClosed is domain.ErrClosed.
+	ErrClosed = domain.ErrClosed
 	// ErrPermissionDenied is domain.ErrPermissionDenied.
 	ErrPermissionDenied = domain.ErrPermissionDenied
 	// ErrRateLimited is domain.ErrRateLimited.
