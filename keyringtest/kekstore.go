@@ -9,10 +9,10 @@ import (
 	"testing"
 
 	"github.com/laenenai/keyring"
-	"github.com/laenenai/keyring/keymanager/local"
+	"github.com/laenenai/keyring/keymanager/kekstore"
 )
 
-// RunKEKStoreSuite runs the contract every local.KEKStore implementation must
+// RunKEKStoreSuite runs the contract every kekstore.KEKStore implementation must
 // satisfy. newStore is called once per subtest, receiving that subtest's own
 // *T, so an implementation that needs per-test setup and teardown (a schema,
 // a transaction that rolls back, a connection pool) registers it with
@@ -35,7 +35,7 @@ import (
 // also why this suite stores byte sequences that are not valid UTF-8 and not
 // null-free: an implementation that put them in a text column would pass a
 // test written with friendlier fixtures and corrupt real key material.
-func RunKEKStoreSuite(t *testing.T, newStore func(t *testing.T) local.KEKStore) {
+func RunKEKStoreSuite(t *testing.T, newStore func(t *testing.T) kekstore.KEKStore) {
 	t.Helper()
 
 	t.Run("AbsentKEKIsErrKEKNotFound", func(t *testing.T) {
@@ -117,7 +117,7 @@ func RunKEKStoreSuite(t *testing.T, newStore func(t *testing.T) local.KEKStore) 
 		if err := store.CreateKEKVersion(ctx, id, keyring.FirstKEKVersion, first); err != nil {
 			t.Fatalf("CreateKEKVersion: %v", err)
 		}
-		if err := store.CreateKEKVersion(ctx, id, keyring.FirstKEKVersion, second); !errors.Is(err, local.ErrKEKVersionExists) {
+		if err := store.CreateKEKVersion(ctx, id, keyring.FirstKEKVersion, second); !errors.Is(err, kekstore.ErrKEKVersionExists) {
 			t.Fatalf("CreateKEKVersion of an existing version error = %v, want ErrKEKVersionExists", err)
 		}
 		got, err := store.WrappedKEK(ctx, id, keyring.FirstKEKVersion)
@@ -153,6 +153,31 @@ func RunKEKStoreSuite(t *testing.T, newStore func(t *testing.T) local.KEKStore) 
 
 		if _, err := store.WrappedKEK(ctx, id, keyring.KEKVersion(9)); !errors.Is(err, keyring.ErrKEKNotFound) {
 			t.Errorf("WrappedKEK(version that was never created) error = %v, want ErrKEKNotFound", err)
+		}
+	})
+
+	t.Run("ListKEKVersionsIsAscending", func(t *testing.T) {
+		store := newStore(t)
+		ctx := context.Background()
+		id := newKEKID(t)
+		material := []byte("material")
+		for _, version := range []keyring.KEKVersion{3, 1, 2} {
+			if err := store.CreateKEKVersion(ctx, id, version, material); err != nil {
+				t.Fatalf("CreateKEKVersion(%s): %v", version, err)
+			}
+		}
+		versions, err := store.ListKEKVersions(ctx, id)
+		if err != nil {
+			t.Fatalf("ListKEKVersions: %v", err)
+		}
+		want := []keyring.KEKVersion{1, 2, 3}
+		if len(versions) != len(want) {
+			t.Fatalf("ListKEKVersions = %v, want %v", versions, want)
+		}
+		for i := range want {
+			if versions[i] != want[i] {
+				t.Fatalf("ListKEKVersions = %v, want %v", versions, want)
+			}
 		}
 	})
 
@@ -281,7 +306,7 @@ func RunKEKStoreSuite(t *testing.T, newStore func(t *testing.T) local.KEKStore) 
 			case err == nil:
 				winners++
 				winner = i
-			case errors.Is(err, local.ErrKEKVersionExists):
+			case errors.Is(err, kekstore.ErrKEKVersionExists):
 			default:
 				t.Errorf("goroutine %d: CreateKEKVersion error = %v, want nil or ErrKEKVersionExists", i, err)
 			}

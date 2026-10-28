@@ -1,6 +1,6 @@
 module github.com/laenenai/keyring
 
-go 1.25.6
+go 1.27.3
 
 require github.com/testcontainers/testcontainers-go v0.44.0
 

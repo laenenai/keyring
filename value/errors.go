@@ -1,4 +1,4 @@
-package domain
+package value
 
 import "errors"
 
@@ -70,17 +70,31 @@ var (
 	// add that detail to the wrapped message either.
 	ErrUnwrapFailed = errors.New("keyring: unwrap failed")
 
+	// ErrPermissionDenied is returned when a backend rejects the
+	// credentials or policy for an otherwise valid request. It is
+	// permanent until the deployment's access is fixed, so adapters do not
+	// retry it.
+	ErrPermissionDenied = errors.New("keyring: permission denied")
+
+	// ErrRateLimited is returned when a backend asks the caller to slow
+	// down. Adapters may retry it with their bounded policy; callers can
+	// use errors.Is to distinguish it from a permanent failure.
+	ErrRateLimited = errors.New("keyring: rate limited")
+
+	// ErrTransient is returned when a backend failed in a way that may
+	// succeed on retry: a 5xx response or a transport error. A mutation
+	// that is not safe to repeat (RotateKEK) still reports this error
+	// without an automatic retry, so the caller can decide.
+	ErrTransient = errors.New("keyring: transient backend error")
+
+	// ErrClosed is returned after an adapter's Close has released its
+	// secrets and connections. Further operations are refused instead of
+	// using zeroized material.
+	ErrClosed = errors.New("keyring: key manager closed")
+
 	// ErrInvalidConfig is returned by an adapter's Open when its
 	// configuration cannot produce a working key manager: no root key, a
 	// root key that is too short, both a key and a key file given, an
 	// unreadable key file, no backing store.
 	ErrInvalidConfig = errors.New("keyring: invalid configuration")
-
-	// ErrNotImplemented is returned by an adapter whose transport this
-	// build does not implement. The external-kms adapter returns it from
-	// Open today: its shape, configuration and conformance wiring exist, its
-	// provider transports do not yet, and a caller that wires one must fail
-	// at startup rather than discover it at the first wrap. The
-	// openbao-transit adapter used to return it and no longer does.
-	ErrNotImplemented = errors.New("keyring: not implemented")
 )

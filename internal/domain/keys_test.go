@@ -402,3 +402,107 @@ func mustJSON(t *testing.T, v any) string {
 	}
 	return string(b)
 }
+
+func TestWrappedDEKRoundTripsThroughBinary(t *testing.T) {
+	t.Parallel()
+
+	w := domain.WrappedDEK{
+		KEKID:      "kek-1",
+		KEKVersion: domain.KEKVersion(4),
+		KeyID:      "blob-1",
+		Format:     domain.WrappedDEKFormatLocal,
+		Ciphertext: []byte{0xDE, 0xAD, 0xBE, 0xEF},
+	}
+	encoded, err := w.MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary: %v", err)
+	}
+
+	var got domain.WrappedDEK
+	if err := got.UnmarshalBinary(encoded); err != nil {
+		t.Fatalf("UnmarshalBinary: %v", err)
+	}
+	if got.KEKID != w.KEKID || got.KEKVersion != w.KEKVersion || got.KeyID != w.KeyID || got.Format != w.Format || !bytes.Equal(got.Ciphertext, w.Ciphertext) {
+		t.Fatalf("round trip = %+v, want %+v", got, w)
+	}
+}
+
+func TestWrappedDEKBinaryRejectsUnknownVersionAndTrailingBytes(t *testing.T) {
+	t.Parallel()
+
+	w := domain.WrappedDEK{
+		KEKID:      "kek-1",
+		KEKVersion: domain.FirstKEKVersion,
+		KeyID:      "blob-1",
+		Format:     domain.WrappedDEKFormatLocal,
+		Ciphertext: []byte{1, 2, 3},
+	}
+	encoded, err := w.MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary: %v", err)
+	}
+
+	unknown := bytes.Clone(encoded)
+	unknown[0] = 0xff
+	var got domain.WrappedDEK
+	if err := got.UnmarshalBinary(unknown); !errors.Is(err, domain.ErrInvalidWrappedDEK) {
+		t.Fatalf("UnmarshalBinary(unknown version) = %v, want ErrInvalidWrappedDEK", err)
+	}
+	if err := got.UnmarshalBinary(append(encoded, 0)); !errors.Is(err, domain.ErrInvalidWrappedDEK) {
+		t.Fatalf("UnmarshalBinary(trailing bytes) = %v, want ErrInvalidWrappedDEK", err)
+	}
+}
+
+func TestWrappedDEKUsesStableJSONFieldNames(t *testing.T) {
+	t.Parallel()
+
+	w := domain.WrappedDEK{
+		KEKID:      "kek-1",
+		KEKVersion: domain.FirstKEKVersion,
+		KeyID:      "blob-1",
+		Format:     domain.WrappedDEKFormatLocal,
+		Ciphertext: []byte{1, 2, 3},
+	}
+	rendered := mustJSON(t, w)
+	for _, field := range []string{`"kek_id"`, `"kek_version"`, `"key_id"`, `"format"`, `"ciphertext"`} {
+		if !strings.Contains(rendered, field) {
+			t.Errorf("JSON %s does not contain stable field %s", rendered, field)
+		}
+	}
+	for _, oldField := range []string{`"KEKID"`, `"KEKVersion"`, `"KeyID"`, `"Format"`, `"Ciphertext"`} {
+		if strings.Contains(rendered, oldField) {
+			t.Errorf("JSON %s still contains Go field name %s", rendered, oldField)
+		}
+	}
+}
+
+func TestWrappedDEKRendersTheAdapterFormat(t *testing.T) {
+	t.Parallel()
+
+	w := domain.WrappedDEK{
+		KEKID:      "kek-1",
+		KEKVersion: domain.FirstKEKVersion,
+		KeyID:      "blob-1",
+		Format:     domain.WrappedDEKFormatOpenBaoTransit,
+		Ciphertext: []byte{1, 2, 3},
+	}
+	if rendered := fmt.Sprint(w); !strings.Contains(rendered, string(domain.WrappedDEKFormatOpenBaoTransit)) {
+		t.Fatalf("WrappedDEK rendering %q does not name its format", rendered)
+	}
+}
+
+func TestWrappedDEKUnmarshalJSONAcceptsLegacyFieldNames(t *testing.T) {
+	t.Parallel()
+
+	const legacy = `{"KEKID":"kek-1","KEKVersion":3,"KeyID":"blob-1","Ciphertext":"AQID"}`
+	var w domain.WrappedDEK
+	if err := json.Unmarshal([]byte(legacy), &w); err != nil {
+		t.Fatalf("unmarshal legacy WrappedDEK: %v", err)
+	}
+	if err := w.Validate(); err != nil {
+		t.Fatalf("legacy WrappedDEK did not validate: %v", err)
+	}
+	if w.KEKID != "kek-1" || w.KEKVersion != 3 || w.KeyID != "blob-1" || !bytes.Equal(w.Ciphertext, []byte{1, 2, 3}) {
+		t.Fatalf("legacy WrappedDEK = %+v", w)
+	}
+}

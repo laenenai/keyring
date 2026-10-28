@@ -10,8 +10,8 @@
 // key is in this process's address space, so an operator who can read the
 // process (or the file, or the environment) can read it. Everything else —
 // per-object DEKs, per-tenant KEKs, lazy rotation, crypto-shredding — is
-// identical, which is why swapping adapters later is a configuration change
-// and not a migration.
+// identical. Swapping adapters keeps the same call sites, but persisted
+// records are adapter-specific and need a side-by-side rewrap migration.
 //
 // # Wire format
 //
@@ -51,12 +51,14 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"sync"
+	"sync/atomic"
 
 	"github.com/laenenai/keyring/internal/domain"
 )
@@ -100,8 +102,25 @@ const (
 	kekAADPrefix = "keyring/local/kek/v1"
 )
 
+// RootKeyEncoding names how a RootKeyFile's contents are encoded. It is
+// required whenever RootKeyFile is set; there is no auto-detection, because a
+// truncated or mis-encoded key that silently decodes to different bytes is
+// indistinguishable from a correct deployment until records fail to unwrap.
+type RootKeyEncoding string
+
+const (
+	// RootKeyEncodingRaw uses the file byte-for-byte. A trailing newline is
+	// part of the key; use printf, not echo, when writing a raw key file.
+	RootKeyEncodingRaw RootKeyEncoding = "raw"
+	// RootKeyEncodingHex decodes hexadecimal text (case-insensitive).
+	RootKeyEncodingHex RootKeyEncoding = "hex"
+	// RootKeyEncodingBase64 decodes standard or URL base64, padded or raw.
+	RootKeyEncodingBase64 RootKeyEncoding = "base64"
+)
+
 // Config configures the local adapter. Exactly one of RootKey and
-// RootKeyFile must be set, and Store is required.
+// RootKeyFile must be set, Store is required, and RootKeyEncoding is required
+// when RootKeyFile is used.
 type Config struct {
 	// RootKey is the deployment root key as raw bytes, at least
 	// MinRootKeyLen of them. Use it when the key reaches the process as a
@@ -110,17 +129,18 @@ type Config struct {
 	RootKey []byte
 
 	// RootKeyFile is a path to read the root key from, as an alternative to
-	// RootKey. Its contents are decoded by a fixed rule, in this order:
-	// hex, then base64 (standard or URL alphabet, padded or not), then the
-	// raw file bytes — surrounding whitespace ignored for the two text
-	// forms. An operator who writes the key with `xxd`, with `base64`, or
-	// with `head -c 32 /dev/urandom > key` therefore all get the same
-	// deployment, and no single encoding is privileged by accident.
+	// RootKey. RootKeyEncoding selects the decoding; there is deliberately
+	// no fallback chain, so a malformed file fails at Open instead of
+	// silently using a different key.
 	//
 	// How the file gets there is the operator's business and not this
 	// module's: a mounted secret, a SOPS-decrypted file, a tmpfs path
 	// written at boot.
 	RootKeyFile string
+
+	// RootKeyEncoding is how RootKeyFile is encoded: raw, hex or base64.
+	// It is ignored when RootKey is used and required when RootKeyFile is.
+	RootKeyEncoding RootKeyEncoding
 
 	// Store is where wrapped KEK material lives. It is required, with no
 	// in-memory default, because the default most likely to be reached for
@@ -128,6 +148,10 @@ type Config struct {
 	// of every encrypted byte — see MemKEKStore, which a test or a
 	// deliberately ephemeral process can pass explicitly.
 	Store KEKStore
+
+	// Logger, when set, receives lifecycle events. It never receives key
+	// material, wrapped records, or the root-key path.
+	Logger *slog.Logger
 }
 
 // String renders the configuration with the deployment root key redacted,
@@ -142,8 +166,8 @@ type Config struct {
 // before these methods that printed the root key. See CONVENTIONS.md's
 // "Rendering a secret".
 func (c Config) String() string {
-	return fmt.Sprintf("local.Config{RootKey: %s, RootKeyFile: %s, Store: %T}",
-		domain.Redacted, domain.Redacted, c.Store)
+	return fmt.Sprintf("local.Config{RootKey: %s, RootKeyFile: %s, RootKeyEncoding: %q, Store: %T}",
+		domain.Redacted, domain.Redacted, c.RootKeyEncoding, c.Store)
 }
 
 // Format implements fmt.Formatter, which is the only interface fmt consults
@@ -157,6 +181,28 @@ func (c Config) Format(s fmt.State, _ rune) { _, _ = io.WriteString(s, c.String(
 // pasted anywhere.
 func (c Config) MarshalJSON() ([]byte, error) { return json.Marshal(c.String()) }
 
+// MarshalXML renders a redacted configuration. encoding/xml consults neither
+// String nor MarshalJSON, so without this method it would reach RootKey
+// through its exported field.
+func (c Config) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
+	redacted := struct {
+		RootKey         string `xml:"RootKey"`
+		RootKeyFile     string `xml:"RootKeyFile"`
+		RootKeyEncoding string `xml:"RootKeyEncoding"`
+		Store           string `xml:"Store"`
+	}{
+		RootKey:         domain.Redacted,
+		RootKeyFile:     domain.Redacted,
+		RootKeyEncoding: string(c.RootKeyEncoding),
+		Store:           fmt.Sprintf("%T", c.Store),
+	}
+	return e.EncodeElement(redacted, start)
+}
+
+// GobEncode makes gob encode only the redacted summary. gob does not consult
+// String or MarshalJSON and would otherwise encode the exported RootKey.
+func (c Config) GobEncode() ([]byte, error) { return []byte(c.String()), nil }
+
 // LogValue renders the configuration as a slog group with the root key and
 // its path redacted, so slog.Any("config", cfg) is safe under every handler.
 // slog's JSONHandler marshals a non-LogValuer attribute with encoding/json
@@ -166,13 +212,23 @@ func (c Config) LogValue() slog.Value {
 	return slog.GroupValue(
 		slog.String("root_key", domain.Redacted),
 		slog.String("root_key_file", domain.Redacted),
+		slog.String("root_key_encoding", string(c.RootKeyEncoding)),
 		slog.String("store", fmt.Sprintf("%T", c.Store)),
 	)
 }
 
 // KeyManager is the local adapter's implementation of
 // keymanager.KeyManager. Open returns one; it is safe for concurrent use.
+//
+// The state is behind a pointer so that a value copy is still a view of the
+// same manager and, more importantly, so the redaction methods can have value
+// receivers. A pointer-receiver-only redaction method is not in the method set
+// of a dereferenced KeyManager, which would let fmt reflect wrapKey.
 type KeyManager struct {
+	state *keyManagerState
+}
+
+type keyManagerState struct {
 	// wrapKey is the AES-256 key that wraps KEK material, derived from the
 	// deployment root key. The root key itself is not retained: once this
 	// is derived there is no operation left that needs it, so keeping it
@@ -182,6 +238,17 @@ type KeyManager struct {
 	// store holds wrapped KEK material and destruction records.
 	store KEKStore
 
+	// logger receives lifecycle events; nil means silent.
+	logger *slog.Logger
+
+	// closed is set by Close before the wrapping key is zeroized.
+	closed    atomic.Bool
+	closeOnce sync.Once
+
+	// wrapKeyMu protects wrapKey against Close. Operations hold the read
+	// lock while they use the key; Close takes the write lock to zeroize it.
+	wrapKeyMu sync.RWMutex
+
 	// mu serializes the operations that create KEK versions — the implicit
 	// creation inside WrapDEK and RotateKEK — so that two goroutines in
 	// this process cannot both decide they are creating the same version.
@@ -189,6 +256,17 @@ type KeyManager struct {
 	// reports ErrKEKVersionExists to the loser; this mutex just keeps the
 	// common single-process case from relying on it.
 	mu sync.Mutex
+
+	// locks serializes operations per KEK. A wrap or read holds the read
+	// lock for the whole operation; rotation and destruction take the write
+	// lock, so a destroy cannot interleave with an in-flight wrap and a
+	// wrap that starts after destruction sees the tombstone.
+	locks sync.Map // domain.KEKID -> *sync.RWMutex
+}
+
+func (s *keyManagerState) lockFor(id domain.KEKID) *sync.RWMutex {
+	lock, _ := s.locks.LoadOrStore(id, &sync.RWMutex{})
+	return lock.(*sync.RWMutex)
 }
 
 // Open validates cfg and returns a key manager over it.
@@ -218,13 +296,82 @@ func Open(ctx context.Context, cfg Config) (*KeyManager, error) {
 	if err != nil {
 		return nil, fmt.Errorf("keyring/local: derive the KEK wrapping key: %w", err)
 	}
-	return &KeyManager{wrapKey: wrapKey, store: cfg.Store}, nil
+	return &KeyManager{state: &keyManagerState{wrapKey: wrapKey, store: cfg.Store, logger: cfg.Logger}}, nil
+}
+
+// CurrentKEKVersion implements keymanager.KEKVersionLister.
+func (k *KeyManager) CurrentKEKVersion(ctx context.Context, kekID domain.KEKID) (domain.KEKVersion, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, fmt.Errorf("keyring/local: current KEK version: %w", err)
+	}
+	if err := k.checkOpen(); err != nil {
+		return 0, err
+	}
+	if err := kekID.Validate(); err != nil {
+		return 0, err
+	}
+	lock := k.state.lockFor(kekID)
+	lock.RLock()
+	defer lock.RUnlock()
+	version, err := k.state.store.CurrentKEKVersion(ctx, kekID)
+	if err != nil {
+		return 0, fmt.Errorf("keyring/local: current KEK version: %w", err)
+	}
+	return version, nil
+}
+
+// ListKEKVersions implements keymanager.KEKVersionLister.
+func (k *KeyManager) ListKEKVersions(ctx context.Context, kekID domain.KEKID) ([]domain.KEKVersion, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("keyring/local: list KEK versions: %w", err)
+	}
+	if err := k.checkOpen(); err != nil {
+		return nil, err
+	}
+	if err := kekID.Validate(); err != nil {
+		return nil, err
+	}
+	lock := k.state.lockFor(kekID)
+	lock.RLock()
+	defer lock.RUnlock()
+	versions, err := k.state.store.ListKEKVersions(ctx, kekID)
+	if err != nil {
+		return nil, fmt.Errorf("keyring/local: list KEK versions: %w", err)
+	}
+	return versions, nil
+}
+
+// Close zeroizes the derived wrapping key. It is idempotent. Operations that
+// start after Close return domain.ErrClosed; Close must not race an in-flight
+// operation.
+func (k *KeyManager) Close() error {
+	k.state.closeOnce.Do(func() {
+		k.state.closed.Store(true)
+		k.state.wrapKeyMu.Lock()
+		clear(k.state.wrapKey)
+		k.state.wrapKey = nil
+		k.state.wrapKeyMu.Unlock()
+		if k.state.logger != nil {
+			k.state.logger.Info("keyring: local key manager closed")
+		}
+	})
+	return nil
+}
+
+func (k *KeyManager) checkOpen() error {
+	if k.state.closed.Load() {
+		return domain.ErrClosed
+	}
+	return nil
 }
 
 // WrapDEK implements keymanager.KeyManager.
 func (k *KeyManager) WrapDEK(ctx context.Context, kekID domain.KEKID, keyID domain.KeyID, dek domain.DEK) (domain.WrappedDEK, error) {
 	if err := ctx.Err(); err != nil {
 		return domain.WrappedDEK{}, fmt.Errorf("keyring/local: wrap DEK: %w", err)
+	}
+	if err := k.checkOpen(); err != nil {
+		return domain.WrappedDEK{}, err
 	}
 	if err := kekID.Validate(); err != nil {
 		return domain.WrappedDEK{}, err
@@ -235,6 +382,10 @@ func (k *KeyManager) WrapDEK(ctx context.Context, kekID domain.KEKID, keyID doma
 	if err := dek.Validate(); err != nil {
 		return domain.WrappedDEK{}, err
 	}
+
+	lock := k.state.lockFor(kekID)
+	lock.RLock()
+	defer lock.RUnlock()
 
 	version, err := k.currentOrCreatedVersion(ctx, kekID)
 	if err != nil {
@@ -255,6 +406,7 @@ func (k *KeyManager) WrapDEK(ctx context.Context, kekID domain.KEKID, keyID doma
 		KEKID:      kekID,
 		KEKVersion: version,
 		KeyID:      keyID,
+		Format:     domain.WrappedDEKFormatLocal,
 		Ciphertext: ciphertext,
 	}, nil
 }
@@ -270,6 +422,9 @@ func (k *KeyManager) WrapDEK(ctx context.Context, kekID domain.KEKID, keyID doma
 func (k *KeyManager) GenerateDEK(ctx context.Context, kekID domain.KEKID, keyID domain.KeyID) (domain.DEK, domain.WrappedDEK, error) {
 	if err := ctx.Err(); err != nil {
 		return domain.DEK{}, domain.WrappedDEK{}, fmt.Errorf("keyring/local: generate DEK: %w", err)
+	}
+	if err := k.checkOpen(); err != nil {
+		return domain.DEK{}, domain.WrappedDEK{}, err
 	}
 	// Validate before drawing entropy, so a caller's typo does not consume
 	// randomness and so the error is the same one WrapDEK would have given.
@@ -299,9 +454,19 @@ func (k *KeyManager) UnwrapDEK(ctx context.Context, wrapped domain.WrappedDEK) (
 	if err := ctx.Err(); err != nil {
 		return domain.DEK{}, fmt.Errorf("keyring/local: unwrap DEK: %w", err)
 	}
+	if err := k.checkOpen(); err != nil {
+		return domain.DEK{}, err
+	}
 	if err := wrapped.Validate(); err != nil {
 		return domain.DEK{}, err
 	}
+	if err := wrapped.ValidateFormat(domain.WrappedDEKFormatLocal); err != nil {
+		return domain.DEK{}, err
+	}
+
+	lock := k.state.lockFor(wrapped.KEKID)
+	lock.RLock()
+	defer lock.RUnlock()
 
 	material, err := k.kekMaterial(ctx, wrapped.KEKID, wrapped.KEKVersion)
 	if err != nil {
@@ -345,14 +510,24 @@ func (k *KeyManager) RewrapDEK(ctx context.Context, wrapped domain.WrappedDEK) (
 	if err := ctx.Err(); err != nil {
 		return domain.WrappedDEK{}, fmt.Errorf("keyring/local: rewrap DEK: %w", err)
 	}
+	if err := k.checkOpen(); err != nil {
+		return domain.WrappedDEK{}, err
+	}
 	if err := wrapped.Validate(); err != nil {
 		return domain.WrappedDEK{}, err
 	}
+	if err := wrapped.ValidateFormat(domain.WrappedDEKFormatLocal); err != nil {
+		return domain.WrappedDEK{}, err
+	}
+
+	lock := k.state.lockFor(wrapped.KEKID)
+	lock.RLock()
+	defer lock.RUnlock()
 
 	// Re-wrapping is not creation: a KEK with no current version is
 	// ErrKEKNotFound, and a destroyed one is ErrKEKDestroyed, both reported by
 	// the store.
-	current, err := k.store.CurrentKEKVersion(ctx, wrapped.KEKID)
+	current, err := k.state.store.CurrentKEKVersion(ctx, wrapped.KEKID)
 	if err != nil {
 		return domain.WrappedDEK{}, fmt.Errorf("keyring/local: rewrap under %s: %w", wrapped.KEKID, err)
 	}
@@ -395,6 +570,7 @@ func (k *KeyManager) RewrapDEK(ctx context.Context, wrapped domain.WrappedDEK) (
 		KEKID:      wrapped.KEKID,
 		KEKVersion: current,
 		KeyID:      wrapped.KeyID,
+		Format:     domain.WrappedDEKFormatLocal,
 		Ciphertext: ciphertext,
 	}, nil
 }
@@ -404,16 +580,23 @@ func (k *KeyManager) RotateKEK(ctx context.Context, kekID domain.KEKID) (domain.
 	if err := ctx.Err(); err != nil {
 		return 0, fmt.Errorf("keyring/local: rotate KEK: %w", err)
 	}
+	if err := k.checkOpen(); err != nil {
+		return 0, err
+	}
 	if err := kekID.Validate(); err != nil {
 		return 0, err
 	}
 
-	k.mu.Lock()
-	defer k.mu.Unlock()
+	lock := k.state.lockFor(kekID)
+	lock.Lock()
+	defer lock.Unlock()
+
+	k.state.mu.Lock()
+	defer k.state.mu.Unlock()
 
 	// Rotation is not creation: a KEK with no current version is
 	// ErrKEKNotFound, so a typo in a KEK id cannot mint a key.
-	current, err := k.store.CurrentKEKVersion(ctx, kekID)
+	current, err := k.state.store.CurrentKEKVersion(ctx, kekID)
 	if err != nil {
 		return 0, fmt.Errorf("keyring/local: rotate %s: %w", kekID, err)
 	}
@@ -425,7 +608,7 @@ func (k *KeyManager) RotateKEK(ctx context.Context, kekID domain.KEKID) (domain.
 			// good as the one this call would have made, so report that
 			// rather than failing a caller whose intent — "there is now a
 			// newer version" — has been satisfied.
-			rotated, readErr := k.store.CurrentKEKVersion(ctx, kekID)
+			rotated, readErr := k.state.store.CurrentKEKVersion(ctx, kekID)
 			if readErr != nil {
 				return 0, fmt.Errorf("keyring/local: rotate %s: re-read after a concurrent rotation: %w", kekID, readErr)
 			}
@@ -441,14 +624,21 @@ func (k *KeyManager) DestroyKEK(ctx context.Context, kekID domain.KEKID) error {
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("keyring/local: destroy KEK: %w", err)
 	}
+	if err := k.checkOpen(); err != nil {
+		return err
+	}
 	if err := kekID.Validate(); err != nil {
 		return err
 	}
 
-	k.mu.Lock()
-	defer k.mu.Unlock()
+	lock := k.state.lockFor(kekID)
+	lock.Lock()
+	defer lock.Unlock()
 
-	if err := k.store.DestroyKEK(ctx, kekID); err != nil {
+	k.state.mu.Lock()
+	defer k.state.mu.Unlock()
+
+	if err := k.state.store.DestroyKEK(ctx, kekID); err != nil {
 		return fmt.Errorf("keyring/local: destroy %s: %w", kekID, err)
 	}
 	return nil
@@ -459,7 +649,7 @@ func (k *KeyManager) DestroyKEK(ctx context.Context, kekID domain.KEKID) error {
 // never created again: the store reports domain.ErrKEKDestroyed and that is
 // propagated unchanged.
 func (k *KeyManager) currentOrCreatedVersion(ctx context.Context, kekID domain.KEKID) (domain.KEKVersion, error) {
-	current, err := k.store.CurrentKEKVersion(ctx, kekID)
+	current, err := k.state.store.CurrentKEKVersion(ctx, kekID)
 	switch {
 	case err == nil:
 		return current, nil
@@ -467,12 +657,12 @@ func (k *KeyManager) currentOrCreatedVersion(ctx context.Context, kekID domain.K
 		return 0, fmt.Errorf("keyring/local: read the current version of %s: %w", kekID, err)
 	}
 
-	k.mu.Lock()
-	defer k.mu.Unlock()
+	k.state.mu.Lock()
+	defer k.state.mu.Unlock()
 
 	// Re-read under the lock: another goroutine may have created the KEK
 	// between the read above and here.
-	if current, err := k.store.CurrentKEKVersion(ctx, kekID); err == nil {
+	if current, err := k.state.store.CurrentKEKVersion(ctx, kekID); err == nil {
 		return current, nil
 	} else if !errors.Is(err, domain.ErrKEKNotFound) {
 		return 0, fmt.Errorf("keyring/local: read the current version of %s: %w", kekID, err)
@@ -481,7 +671,7 @@ func (k *KeyManager) currentOrCreatedVersion(ctx context.Context, kekID domain.K
 	if err := k.createVersion(ctx, kekID, domain.FirstKEKVersion); err != nil {
 		if errors.Is(err, ErrKEKVersionExists) {
 			// Another process won the race; its version 1 is the KEK now.
-			current, readErr := k.store.CurrentKEKVersion(ctx, kekID)
+			current, readErr := k.state.store.CurrentKEKVersion(ctx, kekID)
 			if readErr != nil {
 				return 0, fmt.Errorf("keyring/local: read %s after a concurrent creation: %w", kekID, readErr)
 			}
@@ -493,7 +683,7 @@ func (k *KeyManager) currentOrCreatedVersion(ctx context.Context, kekID domain.K
 }
 
 // createVersion mints fresh random KEK material, wraps it under the root
-// wrapping key, and stores it as the named version. Callers hold k.mu.
+// wrapping key, and stores it as the named version. Callers hold the state mutex.
 func (k *KeyManager) createVersion(ctx context.Context, kekID domain.KEKID, version domain.KEKVersion) error {
 	material := make([]byte, kekMaterialLen)
 	if _, err := rand.Read(material); err != nil {
@@ -501,11 +691,17 @@ func (k *KeyManager) createVersion(ctx context.Context, kekID domain.KEKID, vers
 	}
 	defer clear(material)
 
-	wrapped, err := sealRecord(k.wrapKey, material, kekAAD(kekID, version))
+	k.state.wrapKeyMu.RLock()
+	if k.state.closed.Load() {
+		k.state.wrapKeyMu.RUnlock()
+		return domain.ErrClosed
+	}
+	wrapped, err := sealRecord(k.state.wrapKey, material, kekAAD(kekID, version))
+	k.state.wrapKeyMu.RUnlock()
 	if err != nil {
 		return fmt.Errorf("keyring/local: wrap %s %s under the root key: %w", kekID, version, err)
 	}
-	if err := k.store.CreateKEKVersion(ctx, kekID, version, wrapped); err != nil {
+	if err := k.state.store.CreateKEKVersion(ctx, kekID, version, wrapped); err != nil {
 		// ErrKEKVersionExists is handled by callers and must stay
 		// recognizable through the wrapping.
 		return fmt.Errorf("keyring/local: store %s %s: %w", kekID, version, err)
@@ -522,11 +718,17 @@ func (k *KeyManager) createVersion(ctx context.Context, kekID domain.KEKID, vers
 // deployment's database — and is reported as domain.ErrUnwrapFailed, the
 // same opaque answer as a forged DEK record.
 func (k *KeyManager) kekMaterial(ctx context.Context, kekID domain.KEKID, version domain.KEKVersion) ([]byte, error) {
-	wrapped, err := k.store.WrappedKEK(ctx, kekID, version)
+	wrapped, err := k.state.store.WrappedKEK(ctx, kekID, version)
 	if err != nil {
 		return nil, fmt.Errorf("keyring/local: read %s %s: %w", kekID, version, err)
 	}
-	material, err := openRecord(k.wrapKey, wrapped, kekAAD(kekID, version))
+	k.state.wrapKeyMu.RLock()
+	if k.state.closed.Load() {
+		k.state.wrapKeyMu.RUnlock()
+		return nil, domain.ErrClosed
+	}
+	material, err := openRecord(k.state.wrapKey, wrapped, kekAAD(kekID, version))
+	k.state.wrapKeyMu.RUnlock()
 	if err != nil {
 		return nil, fmt.Errorf("%w: %s %s does not authenticate under this root key", domain.ErrUnwrapFailed, kekID, version)
 	}
@@ -629,24 +831,35 @@ func rootKeyFrom(cfg Config) ([]byte, error) {
 	case len(cfg.RootKey) > 0:
 		root := bytes.Clone(cfg.RootKey)
 		if err := validateRootKey(root, "RootKey"); err != nil {
+			clear(root)
 			return nil, err
 		}
 		return root, nil
 	case cfg.RootKeyFile != "":
+		if cfg.RootKeyEncoding == "" {
+			return nil, fmt.Errorf("%w: RootKeyFile requires RootKeyEncoding (raw, hex or base64)", domain.ErrInvalidConfig)
+		}
 		// G304 is expected and intended here: the path is a deployment
 		// input, which is the entire purpose of RootKeyFile. How the file
 		// gets there is the operator's business (CAS design §8.3).
 		contents, err := os.ReadFile(cfg.RootKeyFile) //nolint:gosec
 		if err != nil {
-			return nil, fmt.Errorf("%w: read RootKeyFile %q: %w", domain.ErrInvalidConfig, cfg.RootKeyFile, err)
+			// Drop the *os.PathError wrapper: its Error() includes the path,
+			// which Config deliberately treats as secret-handling detail.
+			cause := errors.Unwrap(err)
+			if cause == nil {
+				cause = errors.New("read failed")
+			}
+			return nil, fmt.Errorf("%w: read RootKeyFile: %w", domain.ErrInvalidConfig, cause)
 		}
 		defer clear(contents)
 
-		root, err := decodeRootKey(contents)
+		root, err := decodeRootKey(contents, cfg.RootKeyEncoding)
 		if err != nil {
-			return nil, fmt.Errorf("%w: RootKeyFile %q: %w", domain.ErrInvalidConfig, cfg.RootKeyFile, err)
+			return nil, fmt.Errorf("%w: RootKeyFile: %w", domain.ErrInvalidConfig, err)
 		}
-		if err := validateRootKey(root, fmt.Sprintf("RootKeyFile %q", cfg.RootKeyFile)); err != nil {
+		if err := validateRootKey(root, "RootKeyFile"); err != nil {
+			clear(root)
 			return nil, err
 		}
 		return root, nil
@@ -655,27 +868,69 @@ func rootKeyFrom(cfg Config) ([]byte, error) {
 	}
 }
 
-// decodeRootKey applies the documented decode rule for a root key file:
-// hex, then base64 in any alphabet, then the raw bytes. Only a candidate
-// that yields at least MinRootKeyLen bytes is accepted, so a short text file
-// is not mistaken for a raw key.
-func decodeRootKey(contents []byte) ([]byte, error) {
-	trimmed := bytes.TrimSpace(contents)
-
-	if decoded, err := hex.DecodeString(string(trimmed)); err == nil && len(decoded) >= MinRootKeyLen {
-		return decoded, nil
-	}
-	for _, encoding := range []*base64.Encoding{
-		base64.StdEncoding, base64.RawStdEncoding, base64.URLEncoding, base64.RawURLEncoding,
-	} {
-		if decoded, err := encoding.DecodeString(string(trimmed)); err == nil && len(decoded) >= MinRootKeyLen {
-			return decoded, nil
+// decodeRootKey decodes a root key file according to the explicitly selected
+// encoding. There is no fallback chain: a malformed hex/base64 file (or a raw
+// file that is too short) fails at Open instead of silently becoming a
+// different key. Text encodings allow surrounding whitespace but reject
+// internal whitespace, which is where a truncated/wrapped file usually hides.
+func decodeRootKey(contents []byte, encoding RootKeyEncoding) ([]byte, error) {
+	switch encoding {
+	case RootKeyEncodingHex:
+		trimmed := bytes.TrimSpace(contents)
+		if len(trimmed) == 0 {
+			return nil, fmt.Errorf("hex contents are empty")
 		}
-	}
-	if len(contents) >= MinRootKeyLen {
+		if bytes.ContainsAny(trimmed, " \t\r\n") {
+			return nil, fmt.Errorf("hex contents contain whitespace")
+		}
+		if len(trimmed)%2 != 0 {
+			return nil, fmt.Errorf("hex contents have an odd length")
+		}
+		decoded := make([]byte, hex.DecodedLen(len(trimmed)))
+		if _, err := hex.Decode(decoded, trimmed); err != nil {
+			clear(decoded)
+			return nil, fmt.Errorf("decode hex: %w", err)
+		}
+		if len(decoded) < MinRootKeyLen {
+			clear(decoded)
+			return nil, fmt.Errorf("hex contents decode to %d bytes, need at least %d", len(decoded), MinRootKeyLen)
+		}
+		return decoded, nil
+
+	case RootKeyEncodingBase64:
+		trimmed := bytes.TrimSpace(contents)
+		if len(trimmed) == 0 {
+			return nil, fmt.Errorf("base64 contents are empty")
+		}
+		if bytes.ContainsAny(trimmed, " \t\r\n") {
+			return nil, fmt.Errorf("base64 contents contain whitespace")
+		}
+		for _, enc := range []*base64.Encoding{
+			base64.StdEncoding, base64.RawStdEncoding, base64.URLEncoding, base64.RawURLEncoding,
+		} {
+			decoded := make([]byte, enc.DecodedLen(len(trimmed)))
+			n, err := enc.Decode(decoded, trimmed)
+			if err != nil {
+				clear(decoded)
+				continue
+			}
+			decoded = decoded[:n]
+			if len(decoded) >= MinRootKeyLen {
+				return decoded, nil
+			}
+			clear(decoded)
+		}
+		return nil, fmt.Errorf("base64 contents do not decode to at least %d bytes", MinRootKeyLen)
+
+	case RootKeyEncodingRaw:
+		if len(contents) < MinRootKeyLen {
+			return nil, fmt.Errorf("raw contents are %d bytes, need at least %d", len(contents), MinRootKeyLen)
+		}
 		return bytes.Clone(contents), nil
+
+	default:
+		return nil, fmt.Errorf("unknown root key encoding %q", encoding)
 	}
-	return nil, fmt.Errorf("contents are neither hex, base64, nor at least %d raw bytes", MinRootKeyLen)
 }
 
 // validateRootKey rejects a root key that cannot carry the hierarchy: too
@@ -706,27 +961,34 @@ func validateRootKey(root []byte, source string) error {
 // AES-256 key material derived from the deployment root key. Printing the
 // manager must not print the key.
 //
-// The receiver is a pointer because KeyManager holds a sync.Mutex: a value
-// receiver would copy it, which go vet's copylocks check correctly rejects.
-// Open returns *KeyManager, so the pointer is what a consumer holds anyway.
-func (k *KeyManager) String() string {
-	return fmt.Sprintf("local.KeyManager{wrapKey: %s, store: %T}", domain.Redacted, k.store)
+// The receiver is a value so the method is in the method set of a dereferenced
+// or copied KeyManager as well as the pointer. The mutex and key live behind
+// KeyManager.state, so the value copy is safe and cheap.
+func (k KeyManager) String() string {
+	return fmt.Sprintf("local.KeyManager{wrapKey: %s, store: %s}", domain.Redacted, k.storeDescription())
+}
+
+func (k KeyManager) storeDescription() string {
+	if k.state == nil {
+		return "<nil>"
+	}
+	return fmt.Sprintf("%T", k.state.store)
 }
 
 // Format implements fmt.Formatter so that every verb — not only the five fmt
 // routes through Stringer — yields the redacted summary.
-func (k *KeyManager) Format(s fmt.State, _ rune) { _, _ = io.WriteString(s, k.String()) }
+func (k KeyManager) Format(s fmt.State, _ rune) { _, _ = io.WriteString(s, k.String()) }
 
 // MarshalJSON renders the redacted summary. encoding/json skips unexported
 // fields, so a KeyManager already marshalled to "{}" — but that is safety by
 // accident, and it ends the moment a field is exported.
-func (k *KeyManager) MarshalJSON() ([]byte, error) { return json.Marshal(k.String()) }
+func (k KeyManager) MarshalJSON() ([]byte, error) { return json.Marshal(k.String()) }
 
 // LogValue renders the manager as a slog group with the wrapping key
 // redacted.
-func (k *KeyManager) LogValue() slog.Value {
+func (k KeyManager) LogValue() slog.Value {
 	return slog.GroupValue(
 		slog.String("wrap_key", domain.Redacted),
-		slog.String("store", fmt.Sprintf("%T", k.store)),
+		slog.String("store", k.storeDescription()),
 	)
 }

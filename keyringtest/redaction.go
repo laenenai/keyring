@@ -91,7 +91,7 @@ type missingInterface struct {
 
 // missingRedactionInterfaces reports which of the four required interfaces v
 // does not implement. The mapping from interface to rendering is measured
-// behaviour on go1.25.6, not the godoc summary: fmt consults Stringer for %v,
+// behaviour on go1.27.3, not the godoc summary: fmt consults Stringer for %v,
 // %s, %q, %x and %X and for no other verb, which is why Formatter is required
 // rather than merely nice.
 func missingRedactionInterfaces(v any) []missingInterface {

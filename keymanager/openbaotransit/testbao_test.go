@@ -52,9 +52,9 @@ const (
 )
 
 // baoImage is the image CONVENTIONS.md pins for this module's transit
-// adapter, and the one cas's dev stack already runs. The version is exact: a
-// floating tag would make a green run say nothing about what it ran against.
-const baoImage = "openbao/openbao:2.2.1"
+// adapter, and the one cas's dev stack already runs. It is pinned by digest
+// so a retargeted tag cannot change what CI executed.
+const baoImage = "openbao/openbao@sha256:62f582f85e405ef00d48f678c19863d096a2bc0c05e0e5a9bbccd676a1c7316c"
 
 // devRootToken is the root token of the dev-mode server this harness starts.
 // It is a test fixture for an ephemeral container that exists for the length

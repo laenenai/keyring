@@ -3,31 +3,36 @@
 [![ci](https://github.com/laenenai/keyring/actions/workflows/ci.yml/badge.svg)](https://github.com/laenenai/keyring/actions/workflows/ci.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/laenenai/keyring.svg)](https://pkg.go.dev/github.com/laenenai/keyring)
 
-Envelope encryption with the root key outside the process.
+Envelope encryption with the root key outside the process when the key manager
+is OpenBao/Vault. The local adapter keeps the root key in the process.
 
 Wrap and unwrap data encryption keys against a key manager that may be a local
-root key, an OpenBao/Vault transit engine, or an external KMS — behind one
-interface, with one conformance suite every adapter must pass unchanged.
+root key or an OpenBao/Vault transit engine — behind one interface, with one
+conformance suite every adapter must pass unchanged.
 
 > **Status: pre-1.0.** The `local` and `openbao-transit` adapters are
 > implemented and tested, the latter against a real OpenBao container. The
-> `external-kms` adapter is a stub. The API may change before v1.
+> local adapter requires a durable `KEKStore`; `MemKEKStore` is test-only and
+> loses every KEK on process exit. The API may change before v1.
 
 ## Install
 
 ```
 go get github.com/laenenai/keyring
+go get github.com/laenenai/keyring/postgres
 ```
 
-Requires Go 1.25.6 or later. No cgo. The only dependency is
-`testcontainers-go`, and it is test-only.
+Requires Go 1.27.3 or later. No cgo. The root module's only direct dependency
+is `testcontainers-go`, and it is test-only; its transitive modules remain in
+the module graph. The Postgres store is a separately versioned companion
+module so the core module does not depend on a database driver.
 
 ## Example
 
 ```go
 km, err := local.Open(ctx, local.Config{
 	RootKey: rootKey, // at least keyring.DEKSize bytes, from your secret store
-	Store:   local.NewMemKEKStore(),
+	Store:   store,   // a durable local.KEKStore, NOT local.NewMemKEKStore()
 })
 if err != nil {
 	return err
@@ -43,10 +48,40 @@ defer dek.Destroy()
 // Store `wrapped` next to the ciphertext; it records which KEK version
 // wrapped it, so rotation is lazy re-wrapping and never re-encryption.
 back, err := km.UnwrapDEK(ctx, wrapped)
+if err != nil {
+	return err
+}
+defer back.Destroy()
 ```
 
-Swapping `local` for `openbaotransit` changes the import and the config, and
-nothing else: the conformance suite runs against both unchanged.
+`MemKEKStore` is for tests and deliberately ephemeral processes only. A
+deployment that stores content must provide a durable `local.KEKStore`; using
+the in-memory store is crypto-shredding by accident.
+
+The durable reference store is the companion module:
+
+```go
+import keyringpostgres "github.com/laenenai/keyring/postgres"
+
+store, err := keyringpostgres.Open(ctx, dsn)
+if err != nil {
+	return err
+}
+defer store.Close()
+if err := store.Migrate(ctx); err != nil {
+	return err
+}
+```
+
+`Migrate` is idempotent and only creates the store's tables. The store sees
+wrapped KEK material, never the root key, so a stolen database backup is
+useless without the root key. Run the schema migration before serving traffic.
+
+Swapping `local` for `openbaotransit` keeps the same call sites, but existing
+records are adapter-specific and require a side-by-side rewrap migration (old
+adapter unwraps, new adapter wraps). The conformance suite runs against both
+adapters unchanged; the deployment threat model does not: `local` keeps the
+root key in-process, while transit keeps it outside.
 
 ## What it does
 
@@ -55,38 +90,74 @@ nothing else: the conformance suite runs against both unchanged.
   lazy re-wrapping rather than re-encrypting content.
 - `RewrapDEK` moves a record to the current KEK version **without decrypting
   it** on the transit adapter — the plaintext key never enters this process.
-  It is a first-class operation, not unwrap-then-wrap.
-- A `DEK` is zeroizable and redacted through every rendering path: `Format`
-  (which is what covers *every* `fmt` verb, including the `%d` that printed the
-  key before it existed), `String`, `GoString`, `MarshalText`, `MarshalJSON`
-  and `slog.LogValuer`. Unmarshalling one from JSON is refused. Both adapters'
-  `Config` and `KeyManager` redact the same way, so logging a configuration at
-  startup does not log the deployment root key or an OpenBao token.
+  It is a first-class operation, not unwrap-then-wrap; callers that require
+  that property can assert the optional `keyring.RewrapWithoutPlaintext`.
+- Wrapped records carry an adapter format and a versioned binary encoding, so
+  a mixed store can reject the wrong adapter and old records remain readable.
+- OpenBao transport errors are classified as `ErrTransient`, `ErrRateLimited`
+  or `ErrPermissionDenied`; transient failures are retried within
+  `Config.Retry`, except for `RotateKEK`.
+- Both adapters implement the optional `keyring.Closer`, which zeroizes the
+  local wrapping key or clears the transit token and idle connections.
+- A `DEK` is zeroizable and redacted through the controllable rendering paths:
+  `Format` (which covers every `fmt` verb except the documented `%p`/`%T`
+  holes), `String`, `GoString`, `MarshalText`, `MarshalJSON` and
+  `slog.LogValuer`. Unmarshalling one from JSON is refused. Both adapters'
+  `Config` values redact through `fmt`, JSON, XML, gob and `slog`;
+  `KeyManager` values redact through `fmt`, JSON and `slog`. Logging or
+  serializing a configuration at startup therefore does not log the deployment
+  root key or an OpenBao token. `%p` remains a known exception; see
+  `CONVENTIONS.md`.
 
 ## Notes on the adapters
 
 **`local`** derives a per-record key from a per-record salt, so no two records
 share a key and the GCM nonce-reuse bound never caps how many DEKs one KEK may
 wrap. The additional authenticated data binds a record to its KEK id, KEK
-version and key id, so a record cannot be lifted onto a different key.
+version and key id, so a record cannot be lifted onto a different key. The
+root key (or its derived wrapping key) is in this process's address space; the
+`RootKeyFile` encoding is explicit (`raw`, `hex` or `base64`) and never
+auto-detected, so a malformed file fails at startup instead of silently using
+different key material.
 
 **`openbao-transit`** keeps the root key out of this process entirely. It
 creates derived keys, using the key id as transit's context, which is transit's
 counterpart to the local adapter's AAD. `DestroyKEK` writes a tombstone before
 deleting the key, because transit's `encrypt` endpoint *creates* missing keys —
 without the tombstone, wrapping under a destroyed KEK id would silently
-resurrect it as a fresh version, and crypto-shredding would be a lie.
+resurrect it as a fresh version, and crypto-shredding would be a lie. Plain
+HTTP is accepted only for loopback; a remote address requires HTTPS unless
+`AllowInsecureHTTP` is explicitly set. Redirects are never followed.
 
 ## What it does not do
 
-What is being encrypted. Shredding policy. Threshold custody of keys. Any
-domain concept.
+What is being encrypted. Shredding policy. Threshold custody of keys. Backups
+or snapshot erasure. A database driver in the core module: the durable store
+is `github.com/laenenai/keyring/postgres`, or your own `KEKStore`. Any domain
+concept.
+
+## Development
+
+```
+mise install
+mise run test      # fast inner loop; no containers
+mise run test-all  # race detector + OpenBao and Postgres containers; requires Docker
+mise run check     # fmt, lint, build, test-all, generate-check, vuln, api-diff
+```
+
+Tool versions are pinned in `mise.toml`; CI uses the same file via
+`jdx/mise-action`. `mise run generate` is reserved for modules with a
+`sqlc.yaml` and currently fails in this repository; it is not part of `check`.
 
 ## Documentation
 
 - [`CHARTER.md`](CHARTER.md) — the boundary and the two mechanisms that enforce it
-- [`SECURITY.md`](SECURITY.md) — reporting, and what the conformance suite does and does not prove
-- `api.txt` — the public surface as a golden file, diffed in CI
+- [`SECURITY.md`](SECURITY.md) — threat model, reporting, and what the conformance suite proves
+- [`docs/architecture.md`](docs/architecture.md) — key hierarchy, record formats, lifecycle and failure modes
+- [`CONVENTIONS.md`](CONVENTIONS.md) — the shared Go and redaction conventions
+- [`CHANGELOG.md`](CHANGELOG.md) — human-readable release notes
+- [`UPGRADING.md`](UPGRADING.md) — migration steps for breaking changes
+- [`docs/review/20261028_review.md`](docs/review/20261028_review.md) — the production-readiness review and decisions
 
 ## License
 
