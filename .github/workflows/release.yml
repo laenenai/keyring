@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - "v*"
+      - "postgres/v*"
 
 permissions:
   contents: write
@@ -31,9 +32,29 @@ jobs:
       # Pre-1.0 incompatible changes are reported and documented in
       # CHANGELOG.md/UPGRADING.md; after 1.0 a new major module path is needed.
       - name: gorelease
+        if: startsWith(github.ref_name, 'v')
         run: |
           go run golang.org/x/exp/cmd/gorelease@v0.0.0-20261014143641-f0251eb4aa3e \
             -base=latest -version="${GITHUB_REF_NAME}"
+
+      # The Postgres store is a separately versioned companion module. Its
+      # replace directive is a local-development aid; remove it for the
+      # release and publish the root module first so v0.3.0 resolves.
+      - name: gorelease postgres
+        if: startsWith(github.ref_name, 'postgres/')
+        working-directory: postgres
+        run: |
+          version="${GITHUB_REF_NAME#postgres/}"
+          cp go.mod go.mod.release
+          trap 'mv go.mod.release go.mod' EXIT
+          sed -i '/^replace github.com\/laenenai\/keyring => ..\/$/d' go.mod
+          if git tag --list 'postgres/v*' | grep -v -x "postgres/${version}" | grep -q .; then
+            base=latest
+          else
+            base=none
+          fi
+          go run golang.org/x/exp/cmd/gorelease@v0.0.0-20261014143641-f0251eb4aa3e \
+            -base="${base}" -version="${version}"
 
       - name: create GitHub release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2

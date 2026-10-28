@@ -19,11 +19,13 @@ conformance suite every adapter must pass unchanged.
 
 ```
 go get github.com/laenenai/keyring
+go get github.com/laenenai/keyring/postgres
 ```
 
-Requires Go 1.27.3 or later. No cgo. The only direct dependency is
-`testcontainers-go`, and it is test-only; its transitive modules remain in the
-module graph.
+Requires Go 1.27.3 or later. No cgo. The root module's only direct dependency
+is `testcontainers-go`, and it is test-only; its transitive modules remain in
+the module graph. The Postgres store is a separately versioned companion
+module so the core module does not depend on a database driver.
 
 ## Example
 
@@ -55,6 +57,25 @@ defer back.Destroy()
 `MemKEKStore` is for tests and deliberately ephemeral processes only. A
 deployment that stores content must provide a durable `local.KEKStore`; using
 the in-memory store is crypto-shredding by accident.
+
+The durable reference store is the companion module:
+
+```go
+import keyringpostgres "github.com/laenenai/keyring/postgres"
+
+store, err := keyringpostgres.Open(ctx, dsn)
+if err != nil {
+	return err
+}
+defer store.Close()
+if err := store.Migrate(ctx); err != nil {
+	return err
+}
+```
+
+`Migrate` is idempotent and only creates the store's tables. The store sees
+wrapped KEK material, never the root key, so a stolen database backup is
+useless without the root key. Run the schema migration before serving traffic.
 
 Swapping `local` for `openbaotransit` keeps the same call sites, but existing
 records are adapter-specific and require a side-by-side rewrap migration (old
@@ -103,15 +124,16 @@ HTTP is accepted only for loopback; a remote address requires HTTPS unless
 ## What it does not do
 
 What is being encrypted. Shredding policy. Threshold custody of keys. Backups
-or snapshot erasure. A durable local store (the local adapter requires a
-`KEKStore` implementation). Any domain concept.
+or snapshot erasure. A database driver in the core module: the durable store
+is `github.com/laenenai/keyring/postgres`, or your own `KEKStore`. Any domain
+concept.
 
 ## Development
 
 ```
 mise install
 mise run test      # fast inner loop; no containers
-mise run test-all  # race detector + OpenBao container; requires Docker
+mise run test-all  # race detector + OpenBao and Postgres containers; requires Docker
 mise run check     # fmt, lint, build, test-all, generate-check, vuln, api-diff
 ```
 

@@ -33,6 +33,23 @@ release may break the API. See `UPGRADING.md` for migration steps.
   no longer exposes the wrapping key or token. `%p` remains a documented
   exception.
 
+- **The store port moved to `keymanager/kekstore`.** `local.KEKStore`,
+  `local.MemKEKStore`, `local.NewMemKEKStore` and `local.ErrKEKVersionExists`
+  remain aliases for compatibility, but `keyringtest.RunKEKStoreSuite` now
+  takes the neutral type. This removes the test suite's dependency on the
+  local adapter.
+- **`WrappedDEK` has a persistence contract.** Records now carry a `Format`
+  (`local/v1` or `openbao-transit/v1`), stable JSON field names and a
+  versioned `MarshalBinary`/`UnmarshalBinary` encoding. Records written before
+  the field existed have an empty format and remain readable; new records
+  from either adapter name their format.
+- **`RewrapWithoutPlaintext` is an optional capability.** The OpenBao adapter
+  implements it; the local adapter does not claim it, because a local rewrap
+  necessarily decrypts in-process.
+- **`github.com/laenenai/keyring/postgres` is the durable reference store.**
+  It is a separately versioned companion module, applies its schema with
+  `Migrate`, and runs the full `kekstore` conformance suite against Postgres.
+
 ### Security and correctness
 
 - OpenBao redirects are refused, preventing `X-Vault-Token` and plaintext DEKs

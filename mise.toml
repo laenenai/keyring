@@ -32,11 +32,11 @@ fi
 '''
 
 [tasks.lint]
-run = "golangci-lint run"
+run = "golangci-lint run && (cd postgres && golangci-lint run)"
 
 [tasks.test]
 description = "Inner loop: no containers, no databases. Skips at run time, never behind a build tag."
-run = "go test ./... -short -count=1"
+run = "go test ./... -short -count=1 && (cd postgres && go test ./... -short -count=1)"
 
 [tasks.build]
 description = "Proves the shipped binary is cgo-free: inherits CGO_ENABLED=0 from [env]."
@@ -49,7 +49,7 @@ description = "Full suite including container- and database-backed tests."
 # worth more in tests than cgo-freedom is; the cgo-free property is verified by
 # the `build` task, which `check` also depends on.
 env = { CGO_ENABLED = "1" }
-run = "go test ./... -race -count=1"
+run = "go test ./... -race -count=1 && (cd postgres && go test ./... -race -count=1)"
 
 [tasks.generate]
 description = "Regenerate sqlc query code from db/queries against db/migrations."
@@ -91,7 +91,7 @@ echo "generate-check: no generated code or generator config; nothing to generate
 
 [tasks.vuln]
 description = "Report reachable Go vulnerabilities."
-run = "go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./..."
+run = "go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./... && (cd postgres && go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...)"
 
 [tasks.api-diff]
 description = "Compare the importable API with the last root tag using apidiff."

@@ -57,7 +57,60 @@ serializer relied on reading the exported `RootKey`/`Token` fields, it must
 use the redacted representation instead. `%p` remains a known exception; see
 `CONVENTIONS.md`.
 
-### 6. Replace the API golden-file workflow
+### 6. Move store imports to the neutral package
+
+The persistence port now lives in `keymanager/kekstore`:
+
+```go
+import "github.com/laenenai/keyring/keymanager/kekstore"
+
+store := kekstore.NewMemKEKStore() // tests only
+// or: store, err := keyringpostgres.Open(ctx, dsn)
+```
+
+`local.KEKStore`, `local.MemKEKStore`, `local.NewMemKEKStore` and
+`local.ErrKEKVersionExists` are aliases, so existing code keeps compiling.
+`keyringtest.RunKEKStoreSuite` now accepts `kekstore.KEKStore`; callers passing
+a `local.KEKStore` function value need no change because the type is an alias.
+
+### 7. Persist records with the versioned format
+
+New wrapped records carry `Format`. JSON field names are now stable
+(`kek_id`, `kek_version`, `key_id`, `format`, `ciphertext`); if you stored the
+old Go field names, migrate the values or decode both shapes. Prefer
+`WrappedDEK.MarshalBinary`/`UnmarshalBinary` for new storage. An empty
+`Format` is treated as a legacy record and remains readable; an adapter
+rejects a record whose non-empty format belongs to another adapter with
+`ErrInvalidWrappedDEK`.
+
+### 8. Use the optional rewrap capability
+
+If a rotation worker requires that the DEK never enters its process, assert
+`keyring.RewrapWithoutPlaintext` on the manager and use
+`RewrapDEKWithoutPlaintext`. `openbaotransit.KeyManager` implements it; the
+local adapter does not. `RewrapDEK` keeps its existing semantics and remains
+the portable method.
+
+### 9. Install the Postgres companion module
+
+The durable store is no longer part of the root module:
+
+```bash
+go get github.com/laenenai/keyring/postgres
+```
+
+```go
+store, err := keyringpostgres.Open(ctx, dsn)
+if err != nil { return err }
+defer store.Close()
+if err := store.Migrate(ctx); err != nil { return err }
+```
+
+The first release is `postgres/v0.1.0`; it requires root keyring v0.3.0.
+Run this module's schema migration before serving traffic. The root module
+still has no database dependency.
+
+### 10. Replace the API golden-file workflow
 
 The API golden file and its regeneration task are gone. Use:
 
@@ -70,7 +123,8 @@ mise run check          # the full local gate
 `api-diff` reports incompatible changes against the base tag. Pre-1.0 they are
 allowed, but every one must be documented here and in `CHANGELOG.md`. After
 1.0, set `API_DIFF_STRICT=1` and use a new major module path for incompatible
-changes.
+changes. The Postgres companion has its own `postgres/vX.Y.Z` tags and uses
+the same policy.
 
 ## Release policy
 
@@ -78,4 +132,5 @@ changes.
 - Every breaking change gets a changelog entry and an upgrade section.
 - `main` is tagged only after `mise run check` passes.
 - `gorelease` runs on the clean tagged commit; integration/test-only modules
-  are not published and are not tagged.
+  are not published and are not tagged. The published modules are the root
+  module and `github.com/laenenai/keyring/postgres`.
