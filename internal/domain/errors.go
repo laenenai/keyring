@@ -75,12 +75,4 @@ var (
 	// root key that is too short, both a key and a key file given, an
 	// unreadable key file, no backing store.
 	ErrInvalidConfig = errors.New("keyring: invalid configuration")
-
-	// ErrNotImplemented is returned by an adapter whose transport this
-	// build does not implement. The external-kms adapter returns it from
-	// Open today: its shape, configuration and conformance wiring exist, its
-	// provider transports do not yet, and a caller that wires one must fail
-	// at startup rather than discover it at the first wrap. The
-	// openbao-transit adapter used to return it and no longer does.
-	ErrNotImplemented = errors.New("keyring: not implemented")
 )

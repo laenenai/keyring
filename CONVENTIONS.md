@@ -7,7 +7,7 @@ repos read as one codebase.
 
 ## Toolchain and gates
 
-- `go 1.25.6`. **`CGO_ENABLED=0`** — every module must build cgo-free and
+- `go 1.27.3`. **`CGO_ENABLED=0`** — every module must build cgo-free and
   cross-compile. No dependency may require cgo.
 - `gofumpt` (not plain gofmt) for formatting.
 - `golangci-lint` with the committed `.golangci.yml`, unmodified. Enabled:
@@ -103,7 +103,7 @@ exercised against the real thing:
   transaction.
 - Migrations, applied forward on a fresh database.
 - Every external-service adapter against that service's real image —
-  **`openbao/openbao:2.2.1` for `keyring`'s transit adapter**, which `cas`'s
+  **`openbao/openbao@sha256:62f582f85e405ef00d48f678c19863d096a2bc0c05e0e5a9bbccd676a1c7316c` for `keyring`'s transit adapter**, which `cas`'s
   dev stack already runs.
 
 A module whose only adapter is in-memory is an unfinished module, and its
@@ -128,7 +128,7 @@ behave differently in a way that matters, and what the blast radius is.
 | `Now() time.Time` | **no** — returning the current time is not a thing you get subtly wrong | not a module |
 
 **2. Does sharing reduce risk, or only reduce typing?** Reducing typing is not
-worth a `go.mod`, a charter, a CI pipeline, an `api.txt` and a release cadence.
+worth a `go.mod`, a charter, a CI pipeline, a compatibility gate and a release cadence.
 For `Clock` the ceremony would exceed the content roughly thirtyfold.
 
 ### So: `Clock` is a convention, not a module
@@ -174,8 +174,9 @@ with it.
   to a convention produced a real defect: in `audit`, `Verify`,
   `VerifyEntries`, `NewMemory` and `BreakKind`'s constants ended up unreachable
   from outside the module, so a consumer could not use it. A facade that hides
-  what the module is for is not a facade. Reachability is checked by `api.txt`:
-  if a consumer would need to name it, it belongs in the golden file.
+  what the module is for is not a facade. Reachability is checked by the compiler
+  and by `apidiff` against the previous tag: if a consumer would need to name
+  it, it belongs in the importable API and in the changelog when it changes.
 
 ### Postgres timestamp precision
 
@@ -293,20 +294,17 @@ code; `cas` pins 1.31.1. Converging is a deliberate one-commit bump across
 
 - `CHARTER.md` is binding. Code that does not fit the charter belongs in a
   different module — raise it rather than widening the charter.
-- `api.txt` is the public API as a golden file. Growing the public surface is
-  a reviewed diff.
-- **It is generated and checked by an ordinary test**, `api_test.go`, with an
-  `-update-api` flag to rewrite it — Go's golden-file idiom. Not by a
-  `cmd/apilist` main package: that puts a `main` in a library module's public
-  tree, and it has to be remembered. A test runs inside `go test`, so `test`
-  and `test-all` verify the surface automatically and there is no separate
-  `api-check` task to forget. `mise run api` only rewrites.
-- **`api.txt` must cover the `internal/` packages the facade aliases**, not
-  only the importable ones. Because the facade re-exports internal types as
-  aliases, **a change to an internal signature is a change to the public
-  surface** even though Go's internal rule keeps the import path private. A
-  generator listing only importable packages reports an incomplete surface —
-  converting `meter` took its golden file from 76 lines to 261.
+- **Compatibility is checked with Go's export-data tooling, not an
+  AST-generated golden file.** `mise run api-diff` compares the importable API
+  with the last root tag; the release workflow runs `gorelease` on the clean
+  tagged commit. `internal/...` is not part of the public contract; do not use
+  `-allow-internal`.
+- Pre-1.0, `api-diff` reports incompatible changes but does not fail the
+  build. Record every breaking change in `CHANGELOG.md` and add migration
+  steps to `UPGRADING.md`. From 1.0, set `API_DIFF_STRICT=1` and require a new
+  major module path for incompatible changes.
+- `gorelease` requires a clean tree, so it is a release-workflow check, not
+  part of the dirty-branch `check` gate.
 
 ## Rendering a secret: redaction belongs on the type
 
@@ -337,7 +335,7 @@ unexported, and every rendering yields a fixed placeholder.
 | `slog` structured attributes, under every handler | `slog.LogValuer` |
 
 All four. Not a subset, and the subset is the trap — each of the following was
-measured on go1.25.6 rather than inferred, because the inference was wrong
+measured on go1.27.3 rather than inferred, because the inference was wrong
 twice:
 
 - **`fmt.Stringer` covers more than `%v`, and much less than "formatting".**

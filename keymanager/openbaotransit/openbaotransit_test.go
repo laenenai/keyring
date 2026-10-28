@@ -4,12 +4,17 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/gob"
 	"encoding/hex"
+	"encoding/xml"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/laenenai/keyring"
@@ -39,6 +44,93 @@ func TestOpenBaoTransitConformance(t *testing.T) {
 		}
 		return km
 	})
+}
+
+// TestTombstonedKEKCannotBeUsed puts the adapter into the state DestroyKEK
+// can leave after a crash (tombstone present, key material still present) and
+// asserts every operation fails closed. Without this, a partial destroy leaves
+// a KEK that reports destruction on writes while reads still return DEKs.
+func TestTombstonedKEKCannotBeUsed(t *testing.T) {
+	t.Parallel()
+
+	fake := newFakeTransit()
+	srv := fake.server(t)
+	km := fake.keyManager(t, srv)
+
+	dek, err := keyring.NewDEK()
+	if err != nil {
+		t.Fatalf("NewDEK: %v", err)
+	}
+	t.Cleanup(dek.Destroy)
+	fake.plaintext = bytes.Clone(dek.Bytes())
+
+	record := keyring.WrappedDEK{
+		KEKID:      "victim",
+		KEKVersion: 1,
+		KeyID:      "key-1",
+		Ciphertext: []byte("vault:v1:AAAA"),
+	}
+	fake.markDestroyed("victim", true)
+
+	calls := map[string]func() error{
+		"UnwrapDEK": func() error {
+			got, err := km.UnwrapDEK(context.Background(), record)
+			if !got.IsZero() {
+				return fmt.Errorf("UnwrapDEK returned key material: %w", err)
+			}
+			return err
+		},
+		"RewrapDEK": func() error {
+			got, err := km.RewrapDEK(context.Background(), record)
+			if len(got.Ciphertext) != 0 {
+				return fmt.Errorf("RewrapDEK returned a record: %w", err)
+			}
+			return err
+		},
+		"RotateKEK": func() error {
+			_, err := km.RotateKEK(context.Background(), "victim")
+			return err
+		},
+		"WrapDEK": func() error {
+			_, err := km.WrapDEK(context.Background(), "victim", "key-1", dek)
+			return err
+		},
+		"GenerateDEK": func() error {
+			_, _, err := km.GenerateDEK(context.Background(), "victim", "key-1")
+			return err
+		},
+	}
+	for name, call := range calls {
+		if err := call(); !errors.Is(err, keyring.ErrKEKDestroyed) {
+			t.Errorf("%s with a tombstone present error = %v, want ErrKEKDestroyed", name, err)
+		}
+	}
+}
+
+// TestWrapRaceWithDestroyFailsClosed simulates DestroyKEK completing between
+// the tombstone check and the encrypt/datakey call. The adapter must re-check
+// the tombstone after the call and fail rather than return a record under a
+// resurrected key.
+func TestWrapRaceWithDestroyFailsClosed(t *testing.T) {
+	t.Parallel()
+
+	fake := newFakeTransit()
+	srv := fake.server(t)
+	km := fake.keyManager(t, srv)
+	fake.markDestroyOnEncrypt("victim")
+
+	dek, err := keyring.NewDEK()
+	if err != nil {
+		t.Fatalf("NewDEK: %v", err)
+	}
+	t.Cleanup(dek.Destroy)
+
+	if _, err := km.WrapDEK(context.Background(), "victim", "key-1", dek); !errors.Is(err, keyring.ErrKEKDestroyed) {
+		t.Errorf("WrapDEK racing DestroyKEK error = %v, want ErrKEKDestroyed", err)
+	}
+	if _, _, err := km.GenerateDEK(context.Background(), "victim", "key-1"); !errors.Is(err, keyring.ErrKEKDestroyed) {
+		t.Errorf("GenerateDEK racing DestroyKEK error = %v, want ErrKEKDestroyed", err)
+	}
 }
 
 // TestRewrapNeverPutsTheDEKOnTheWire is the one assertion the generic suite
@@ -232,6 +324,18 @@ func TestOpenRejectsUnusableConfig(t *testing.T) {
 			"empty_mount_segment",
 			openbaotransit.Config{Address: "https://openbao.invalid:8200", Token: "t", MountPath: "a//b"},
 		},
+		{
+			"userinfo_in_address",
+			openbaotransit.Config{Address: "https://user:pass@openbao.invalid:8200", Token: "t"}, //nolint:gosec // test fixture for userinfo rejection
+		},
+		{
+			"path_in_address",
+			openbaotransit.Config{Address: "https://openbao.invalid:8200/v1", Token: "t"},
+		},
+		{
+			"query_in_address",
+			openbaotransit.Config{Address: "https://openbao.invalid:8200?x=1", Token: "t"},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -245,6 +349,95 @@ func TestOpenRejectsUnusableConfig(t *testing.T) {
 				t.Fatal("Open returned a key manager alongside its error")
 			}
 		})
+	}
+}
+
+// TestOpenRejectsPlainHTTPToNonLoopback: a token and DEK plaintext must not
+// travel over cleartext to a remote host. Loopback HTTP is allowed because it
+// is the normal local-dev/test case and does not cross a network boundary.
+func TestOpenRejectsPlainHTTPToNonLoopback(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name    string
+		address string
+		allow   bool
+		wantErr bool
+	}{
+		{"non_loopback_http", "http://192.0.2.1:8200", false, true},
+		{"non_loopback_http_allowed", "http://192.0.2.1:8200", true, false},
+		{"loopback_http", "http://127.0.0.1:8200", false, false},
+		{"loopback_http_v6", "http://[::1]:8200", false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			km, err := openbaotransit.Open(context.Background(), openbaotransit.Config{
+				Address:           tc.address,
+				Token:             "t",
+				AllowInsecureHTTP: tc.allow,
+			})
+			if tc.wantErr {
+				if !errors.Is(err, keyring.ErrInvalidConfig) {
+					t.Fatalf("Open(%s) error = %v, want ErrInvalidConfig", tc.name, err)
+				}
+				if km != nil {
+					t.Fatal("Open returned a key manager alongside its error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Open(%s): %v", tc.name, err)
+			}
+		})
+	}
+}
+
+// TestRedirectIsNotFollowed: a redirect must not receive the X-Vault-Token
+// header (and, for WrapDEK, the plaintext DEK in the replayed body). The
+// adapter must refuse redirects rather than trusting the endpoint to stay on
+// the same origin.
+func TestRedirectIsNotFollowed(t *testing.T) {
+	t.Parallel()
+
+	var hits atomic.Int32
+	collector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"data":{"ciphertext":"vault:v1:AAAA","plaintext":"MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=","key_version":1}}`)
+	}))
+	defer collector.Close()
+
+	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/keys/destroyed-kek-") {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = fmt.Fprint(w, `{"errors":["key not found"]}`)
+			return
+		}
+		http.Redirect(w, r, collector.URL+r.URL.Path, http.StatusTemporaryRedirect) //nolint:gosec // deliberately testing redirect refusal
+	}))
+	defer source.Close()
+
+	km, err := openbaotransit.Open(context.Background(), openbaotransit.Config{
+		Address: source.URL,
+		Token:   "s.super-secret-token",
+	})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	dek, err := keyring.NewDEK()
+	if err != nil {
+		t.Fatalf("NewDEK: %v", err)
+	}
+	t.Cleanup(dek.Destroy)
+
+	if _, _, err := km.GenerateDEK(context.Background(), "victim", "key-1"); err == nil {
+		t.Fatal("GenerateDEK followed a redirect; want a refused redirect error")
+	}
+	if got := hits.Load(); got != 0 {
+		t.Fatalf("redirect target received %d request(s); the token/body must not be forwarded", got)
 	}
 }
 
@@ -273,6 +466,37 @@ func TestConfigRedactsTheToken(t *testing.T) {
 	keyringtest.NoSecretLeaksInAnyRendering(t, cfg, []byte(token))
 }
 
+// TestConfigDoesNotLeakTheTokenThroughXMLOrGob: XML and gob do not consult
+// MarshalJSON/String/LogValue, so a Config with an exported Token field must
+// implement their interfaces too.
+func TestConfigDoesNotLeakTheTokenThroughXMLOrGob(t *testing.T) {
+	t.Parallel()
+
+	const token = "s.a-very-secret-openbao-token"
+	cfg := openbaotransit.Config{Address: "https://openbao.invalid:8200", Token: token, MountPath: "transit"}
+
+	x, err := xml.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("xml.Marshal: %v", err)
+	}
+	var buf bytes.Buffer
+	if err := gob.NewEncoder(&buf).Encode(cfg); err != nil {
+		t.Fatalf("gob.Encode: %v", err)
+	}
+
+	for name, rendering := range map[string]string{
+		"xml": string(x),
+		"gob": buf.String(),
+	} {
+		if strings.Contains(rendering, token) {
+			t.Errorf("%s leaked the OpenBao token: %q", name, rendering)
+		}
+		if !strings.Contains(rendering, keyring.Redacted) {
+			t.Errorf("%s does not contain a redaction marker: %q", name, rendering)
+		}
+	}
+}
+
 // TestKeyManagerRedactsTheTokenInEveryRendering covers the value Open hands
 // back, not just the config it was given: a *KeyManager retains the token as
 // the X-Vault-Token header value, and it is in scope wherever the error
@@ -291,6 +515,22 @@ func TestKeyManagerRedactsTheTokenInEveryRendering(t *testing.T) {
 	}
 
 	keyringtest.NoSecretLeaksInAnyRendering(t, km, []byte(token))
+
+	// The pointer is the common case, but a caller can dereference or copy a
+	// manager. The four redaction interfaces must be in the value method set
+	// too, or fmt reflects the unexported token.
+	for name, rendering := range map[string]string{
+		"value %v":  fmt.Sprintf("%v", *km),
+		"value %+v": fmt.Sprintf("%+v", *km),
+		"value %#v": fmt.Sprintf("%#v", *km),
+	} {
+		if strings.Contains(rendering, token) {
+			t.Errorf("%s leaked the OpenBao token: %s", name, rendering)
+		}
+		if !strings.Contains(rendering, keyring.Redacted) {
+			t.Errorf("%s does not contain a redaction marker: %s", name, rendering)
+		}
+	}
 }
 
 // TestRecordVersionMismatchIsRejectedWithoutTheServer runs in -short, and

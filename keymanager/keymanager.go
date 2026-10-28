@@ -7,8 +7,8 @@
 // same code path as the single-binary default (see the local adapter in
 // ./local, and CAS design §8.3).
 //
-// Every adapter — local here, openbao-transit and external-kms alongside it,
-// and an adapter a consumer writes against its own KMS — must pass
+// Every adapter — local here, openbao-transit alongside it, and an adapter a
+// consumer writes against its own KMS — must pass
 // keyringtest.RunKeyManagerSuite unchanged; that suite, not this file, is the
 // authoritative description of the contract's edge-case behavior, including
 // what fails closed, what is idempotent, and what a destroyed KEK does to

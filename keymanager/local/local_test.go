@@ -3,10 +3,15 @@ package local_test
 import (
 	"bytes"
 	"context"
+	"crypto/hkdf"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/gob"
 	"encoding/hex"
+	"encoding/xml"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -51,7 +56,7 @@ func TestOpenRejectsUnusableConfig(t *testing.T) {
 		{"no_root_key_at_all", local.Config{Store: local.NewMemKEKStore()}},
 		{
 			"both_root_key_and_root_key_file",
-			local.Config{RootKey: randomRootKey(t), RootKeyFile: shortFile, Store: local.NewMemKEKStore()},
+			local.Config{RootKey: randomRootKey(t), RootKeyFile: shortFile, RootKeyEncoding: local.RootKeyEncodingRaw, Store: local.NewMemKEKStore()},
 		},
 		{
 			"root_key_too_short",
@@ -64,10 +69,11 @@ func TestOpenRejectsUnusableConfig(t *testing.T) {
 		{"no_store", local.Config{RootKey: randomRootKey(t)}},
 		{
 			"unreadable_root_key_file",
-			local.Config{RootKeyFile: filepath.Join(dir, "does-not-exist"), Store: local.NewMemKEKStore()},
+			local.Config{RootKeyFile: filepath.Join(dir, "does-not-exist"), RootKeyEncoding: local.RootKeyEncodingRaw, Store: local.NewMemKEKStore()},
 		},
-		{"empty_root_key_file", local.Config{RootKeyFile: emptyFile, Store: local.NewMemKEKStore()}},
-		{"short_root_key_file", local.Config{RootKeyFile: shortFile, Store: local.NewMemKEKStore()}},
+		{"empty_root_key_file", local.Config{RootKeyFile: emptyFile, RootKeyEncoding: local.RootKeyEncodingRaw, Store: local.NewMemKEKStore()}},
+		{"short_root_key_file", local.Config{RootKeyFile: shortFile, RootKeyEncoding: local.RootKeyEncodingRaw, Store: local.NewMemKEKStore()}},
+		{"root_key_file_missing_encoding", local.Config{RootKeyFile: shortFile, Store: local.NewMemKEKStore()}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -112,13 +118,16 @@ func TestRootKeyFileEncodings(t *testing.T) {
 
 	root := randomRootKey(t)
 	dir := t.TempDir()
-	files := map[string][]byte{
-		"hex":                 []byte(hex.EncodeToString(root)),
-		"hex_with_newline":    []byte(hex.EncodeToString(root) + "\n"),
-		"base64":              []byte(base64.StdEncoding.EncodeToString(root)),
-		"base64_raw":          []byte(base64.RawStdEncoding.EncodeToString(root)),
-		"base64_with_newline": []byte(base64.StdEncoding.EncodeToString(root) + "\n"),
-		"raw":                 root,
+	files := map[string]struct {
+		contents []byte
+		encoding local.RootKeyEncoding
+	}{
+		"hex":                 {[]byte(hex.EncodeToString(root)), local.RootKeyEncodingHex},
+		"hex_with_newline":    {[]byte(hex.EncodeToString(root) + "\n"), local.RootKeyEncodingHex},
+		"base64":              {[]byte(base64.StdEncoding.EncodeToString(root)), local.RootKeyEncodingBase64},
+		"base64_raw":          {[]byte(base64.RawStdEncoding.EncodeToString(root)), local.RootKeyEncodingBase64},
+		"base64_with_newline": {[]byte(base64.StdEncoding.EncodeToString(root) + "\n"), local.RootKeyEncodingBase64},
+		"raw":                 {root, local.RootKeyEncodingRaw},
 	}
 
 	store := local.NewMemKEKStore()
@@ -137,14 +146,18 @@ func TestRootKeyFileEncodings(t *testing.T) {
 		t.Fatalf("WrapDEK: %v", err)
 	}
 
-	for name, contents := range files {
+	for name, file := range files {
 		t.Run(name, func(t *testing.T) {
 			path := filepath.Join(dir, name)
-			if err := os.WriteFile(path, contents, 0o600); err != nil {
+			if err := os.WriteFile(path, file.contents, 0o600); err != nil {
 				t.Fatalf("write key file: %v", err)
 			}
 
-			km, err := local.Open(ctx, local.Config{RootKeyFile: path, Store: store})
+			km, err := local.Open(ctx, local.Config{
+				RootKeyFile:     path,
+				RootKeyEncoding: file.encoding,
+				Store:           store,
+			})
 			if err != nil {
 				t.Fatalf("Open with a %s root key file: %v", name, err)
 			}
@@ -155,6 +168,56 @@ func TestRootKeyFileEncodings(t *testing.T) {
 			t.Cleanup(got.Destroy)
 			if !bytes.Equal(got.Bytes(), material) {
 				t.Fatalf("a %s root key file decoded to different key material", name)
+			}
+		})
+	}
+}
+
+// TestRootKeyFileRejectsMalformedInput pins the explicit-encoding rule. A
+// truncated hex/base64 key or an unlabelled text file must fail at Open rather
+// than silently use different material. Raw is byte-for-byte: a 42-byte file
+// is a valid raw key, not a mistake to reinterpret.
+func TestRootKeyFileRejectsMalformedInput(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	root := bytes.Repeat([]byte{0x5A}, local.MinRootKeyLen)
+	hexKey := hex.EncodeToString(root)
+	base64Key := base64.StdEncoding.EncodeToString(root)
+
+	cases := []struct {
+		name     string
+		contents []byte
+		encoding local.RootKeyEncoding
+		wantErr  bool
+	}{
+		{"missing_encoding", []byte(hexKey), "", true},
+		{"truncated_hex", []byte(hexKey[:len(hexKey)-1]), local.RootKeyEncodingHex, true},
+		{"internal_space_hex", []byte(hexKey[:32] + " " + hexKey[32:]), local.RootKeyEncodingHex, true},
+		{"truncated_base64", []byte(base64Key[:len(base64Key)-2]), local.RootKeyEncodingBase64, true},
+		{"internal_newline_base64", []byte(base64Key[:20] + "\n" + base64Key[20:]), local.RootKeyEncodingBase64, true},
+		{"raw_without_encoding", root, "", true},
+		{"raw_exact_42_bytes", bytes.Repeat([]byte("a"), 42), local.RootKeyEncodingRaw, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(dir, tc.name)
+			if err := os.WriteFile(path, tc.contents, 0o600); err != nil {
+				t.Fatalf("write key file: %v", err)
+			}
+			_, err := local.Open(context.Background(), local.Config{
+				RootKeyFile:     path,
+				RootKeyEncoding: tc.encoding,
+				Store:           local.NewMemKEKStore(),
+			})
+			if tc.wantErr {
+				if !errors.Is(err, keyring.ErrInvalidConfig) {
+					t.Fatalf("Open(%s) error = %v, want ErrInvalidConfig", tc.name, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Open(%s): %v", tc.name, err)
 			}
 		})
 	}
@@ -429,4 +492,83 @@ func TestConfigAndKeyManagerRedactTheRootKeyInEveryRendering(t *testing.T) {
 		// in its own right, so both are off limits.
 		keyringtest.NoSecretLeaksInAnyRendering(t, km, root)
 	})
+}
+
+// TestConfigDoesNotLeakTheRootKeyThroughXMLOrGob: fmt, json and slog are not
+// the only encoders a caller may use. XML and gob consult their own interfaces
+// and see the exported RootKey field unless the type redacts them explicitly.
+func TestConfigDoesNotLeakTheRootKeyThroughXMLOrGob(t *testing.T) {
+	t.Parallel()
+
+	root := bytes.Repeat([]byte{'A'}, local.MinRootKeyLen)
+	cfg := local.Config{RootKey: root}
+
+	x, err := xml.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("xml.Marshal: %v", err)
+	}
+	var buf bytes.Buffer
+	if err := gob.NewEncoder(&buf).Encode(cfg); err != nil {
+		t.Fatalf("gob.Encode: %v", err)
+	}
+
+	for name, rendering := range map[string]string{
+		"xml": string(x),
+		"gob": buf.String(),
+	} {
+		for label, encoded := range map[string]string{
+			"raw":    string(root),
+			"hex":    hex.EncodeToString(root),
+			"base64": base64.StdEncoding.EncodeToString(root),
+		} {
+			if strings.Contains(rendering, encoded) {
+				t.Errorf("%s leaked the root key as %s: %q", name, label, rendering)
+			}
+		}
+		if !strings.Contains(rendering, keyring.Redacted) {
+			t.Errorf("%s does not contain a redaction marker: %q", name, rendering)
+		}
+	}
+}
+
+// TestKeyManagerValueRedactsTheDerivedWrappingKey: redaction must survive a
+// dereference/copy of the manager. A caller that logs *km or puts a manager
+// value in a struct does not get the pointer method set, and fmt then reflects
+// the unexported wrapKey bytes.
+func TestKeyManagerValueRedactsTheDerivedWrappingKey(t *testing.T) {
+	t.Parallel()
+
+	root := randomRootKey(t)
+	km, err := local.Open(context.Background(), local.Config{
+		RootKey: root,
+		Store:   local.NewMemKEKStore(),
+	})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	wrapKey, err := hkdf.Key(sha256.New, root, nil, "keyring/local/root-wrap/v1", local.MinRootKeyLen)
+	if err != nil {
+		t.Fatalf("derive expected wrapping key: %v", err)
+	}
+	t.Cleanup(func() { clear(wrapKey) })
+
+	for name, rendering := range map[string]string{
+		"value %v":  fmt.Sprintf("%v", *km),
+		"value %+v": fmt.Sprintf("%+v", *km),
+		"value %#v": fmt.Sprintf("%#v", *km),
+	} {
+		for label, encoded := range map[string]string{
+			"raw":      string(wrapKey),
+			"go slice": fmt.Sprintf("%v", wrapKey),
+			"hex":      hex.EncodeToString(wrapKey),
+			"base64":   base64.StdEncoding.EncodeToString(wrapKey),
+		} {
+			if strings.Contains(rendering, encoded) {
+				t.Errorf("%s leaked the derived wrapping key as %s: %s", name, label, rendering)
+			}
+		}
+		if !strings.Contains(rendering, keyring.Redacted) {
+			t.Errorf("%s does not contain a redaction marker: %s", name, rendering)
+		}
+	}
 }

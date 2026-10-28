@@ -25,7 +25,11 @@
 //
 // Wiring the default, in-process adapter:
 //
-//	km, err := local.Open(ctx, local.Config{RootKeyFile: "/run/secrets/root.key", Store: store})
+//	km, err := local.Open(ctx, local.Config{
+//		RootKeyFile:     "/run/secrets/root.key",
+//		RootKeyEncoding: local.RootKeyEncodingRaw,
+//		Store:           store,
+//	})
 //	if err != nil {
 //		return err
 //	}
@@ -93,8 +97,6 @@ var (
 	ErrUnwrapFailed = domain.ErrUnwrapFailed
 	// ErrInvalidConfig is domain.ErrInvalidConfig.
 	ErrInvalidConfig = domain.ErrInvalidConfig
-	// ErrNotImplemented is domain.ErrNotImplemented.
-	ErrNotImplemented = domain.ErrNotImplemented
 )
 
 // NewDEK returns a fresh DEK read from crypto/rand. See domain.NewDEK.

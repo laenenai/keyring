@@ -81,10 +81,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"slices"
@@ -148,16 +150,25 @@ type Config struct {
 	// mount ("platform/transit") is allowed.
 	MountPath string
 
+	// AllowInsecureHTTP permits a plain http:// address for a non-loopback
+	// host. It is false by default because the token and plaintext DEKs
+	// travel in request headers/bodies. Loopback HTTP is always allowed for
+	// local development and tests. Do not enable this across an untrusted
+	// network.
+	AllowInsecureHTTP bool
+
 	// HTTPClient, when set, is used for every request, so a deployment can
 	// supply its own TLS configuration, proxy, connection pooling or
-	// timeout. Nil means a client with DefaultTimeout.
+	// timeout. Nil means a client with DefaultTimeout. The adapter clones
+	// the client and replaces CheckRedirect so a redirect cannot forward
+	// the X-Vault-Token header or a plaintext DEK to another origin.
 	HTTPClient *http.Client
 }
 
 // String renders the configuration with the token redacted.
 func (c Config) String() string {
-	return fmt.Sprintf("openbaotransit.Config{Address: %q, Token: %s, MountPath: %q}",
-		c.Address, domain.Redacted, c.MountPath)
+	return fmt.Sprintf("openbaotransit.Config{Address: %q, Token: %s, MountPath: %q, AllowInsecureHTTP: %t}",
+		c.Address, domain.Redacted, c.MountPath, c.AllowInsecureHTTP)
 }
 
 // Format implements fmt.Formatter. String and LogValue were not enough on
@@ -173,6 +184,28 @@ func (c Config) Format(s fmt.State, _ rune) { _, _ = io.WriteString(s, c.String(
 // non-LogValuer attribute with encoding/json, did the same.
 func (c Config) MarshalJSON() ([]byte, error) { return json.Marshal(c.String()) }
 
+// MarshalXML renders a redacted configuration. encoding/xml consults neither
+// String nor MarshalJSON, so without this method it would reach Token through
+// its exported field.
+func (c Config) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
+	redacted := struct {
+		Address           string `xml:"Address"`
+		Token             string `xml:"Token"`
+		MountPath         string `xml:"MountPath"`
+		AllowInsecureHTTP bool   `xml:"AllowInsecureHTTP"`
+	}{
+		Address:           c.Address,
+		Token:             domain.Redacted,
+		MountPath:         c.MountPath,
+		AllowInsecureHTTP: c.AllowInsecureHTTP,
+	}
+	return e.EncodeElement(redacted, start)
+}
+
+// GobEncode makes gob encode only the redacted summary. gob does not consult
+// String or MarshalJSON and would otherwise encode the exported Token.
+func (c Config) GobEncode() ([]byte, error) { return []byte(c.String()), nil }
+
 // LogValue renders the configuration as a slog group with the token redacted,
 // so slog.Any("config", cfg) is safe.
 func (c Config) LogValue() slog.Value {
@@ -180,6 +213,7 @@ func (c Config) LogValue() slog.Value {
 		slog.String("address", c.Address),
 		slog.String("token", domain.Redacted),
 		slog.String("mount_path", c.MountPath),
+		slog.Bool("allow_insecure_http", c.AllowInsecureHTTP),
 	)
 }
 
@@ -226,6 +260,18 @@ func Open(ctx context.Context, cfg Config) (*KeyManager, error) {
 	if parsed.Host == "" {
 		return nil, fmt.Errorf("%w: Address %q has no host", domain.ErrInvalidConfig, cfg.Address)
 	}
+	if parsed.User != nil {
+		return nil, fmt.Errorf("%w: Address must not carry userinfo; use Token", domain.ErrInvalidConfig)
+	}
+	if parsed.Path != "" && parsed.Path != "/" {
+		return nil, fmt.Errorf("%w: Address %q must not carry a path", domain.ErrInvalidConfig, cfg.Address)
+	}
+	if parsed.RawQuery != "" || parsed.Fragment != "" {
+		return nil, fmt.Errorf("%w: Address %q must not carry a query or fragment", domain.ErrInvalidConfig, cfg.Address)
+	}
+	if parsed.Scheme == "http" && !cfg.AllowInsecureHTTP && !isLoopbackHost(parsed.Hostname()) {
+		return nil, fmt.Errorf("%w: Address %q is plain http to a non-loopback host; set AllowInsecureHTTP only for a trusted network", domain.ErrInvalidConfig, cfg.Address)
+	}
 	if cfg.Token == "" {
 		return nil, fmt.Errorf("%w: Token is required", domain.ErrInvalidConfig)
 	}
@@ -238,12 +284,39 @@ func Open(ctx context.Context, cfg Config) (*KeyManager, error) {
 	if client == nil {
 		client = &http.Client{Timeout: DefaultTimeout}
 	}
+	// Clone the caller's client so the redirect policy is enforced without
+	// mutating a value the caller may use elsewhere. A redirect on a key
+	// manager request is never something this adapter should follow: Go
+	// forwards custom headers such as X-Vault-Token across hosts, and
+	// 307/308 requests replay the body (which can contain a plaintext DEK).
+	clone := *client
+	clone.CheckRedirect = refuseRedirect
+	client = &clone
+
 	return &KeyManager{
 		base:   strings.TrimSuffix(parsed.String(), "/"),
 		mount:  mount,
 		token:  cfg.Token,
 		client: client,
 	}, nil
+}
+
+// refuseRedirect is installed on every client. http.ErrUseLastResponse makes
+// Client.Do return the redirect response without following it, which then
+// flows through the ordinary non-2xx error path.
+func refuseRedirect(*http.Request, []*http.Request) error {
+	return http.ErrUseLastResponse
+}
+
+// isLoopbackHost reports whether host is a literal loopback address or the
+// conventional localhost name. Hostnames that merely resolve to a loopback
+// address are not accepted, because Open does not perform DNS resolution.
+func isLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // WrapDEK implements keymanager.KeyManager, over transit's encrypt endpoint.
@@ -278,7 +351,20 @@ func (k *KeyManager) WrapDEK(ctx context.Context, kekID domain.KEKID, keyID doma
 	if err != nil {
 		return domain.WrappedDEK{}, err
 	}
-	return record(kekID, keyID, res)
+	wrapped, err := record(kekID, keyID, res)
+	if err != nil {
+		return domain.WrappedDEK{}, err
+	}
+	// DestroyKEK may have completed between the check above and the encrypt.
+	// Re-read the tombstone before returning: if destruction won, the key was
+	// recreated by transit's upsert and the record must not escape.
+	if err := k.refuseIfDestroyed(ctx, kekID); err != nil {
+		if errors.Is(err, domain.ErrKEKDestroyed) {
+			k.removeResurrectedKey(ctx, kekID)
+		}
+		return domain.WrappedDEK{}, err
+	}
+	return wrapped, nil
 }
 
 // GenerateDEK implements keymanager.KeyManager, over transit's
@@ -313,6 +399,14 @@ func (k *KeyManager) GenerateDEK(ctx context.Context, kekID domain.KEKID, keyID 
 	if err != nil {
 		return domain.DEK{}, domain.WrappedDEK{}, err
 	}
+	// See WrapDEK: destroy may have won after the pre-check, and the datakey
+	// endpoint can recreate the key just as encrypt can.
+	if err := k.refuseIfDestroyed(ctx, kekID); err != nil {
+		if errors.Is(err, domain.ErrKEKDestroyed) {
+			k.removeResurrectedKey(ctx, kekID)
+		}
+		return domain.DEK{}, domain.WrappedDEK{}, err
+	}
 	dek, err := domain.DEKFrom(res.Data.Plaintext)
 	if err != nil {
 		return domain.DEK{}, domain.WrappedDEK{}, fmt.Errorf("keyring/openbaotransit: generate a DEK under %s: %w", kekID, err)
@@ -336,6 +430,13 @@ func (k *KeyManager) UnwrapDEK(ctx context.Context, wrapped domain.WrappedDEK) (
 		return domain.DEK{}, k.classifyRecord(ctx, wrapped, "unwrap", err)
 	}
 	defer clear(res.Data.Plaintext)
+
+	// A destroy may have started or completed while the decrypt was in
+	// flight. The tombstone is authoritative: the DEK must not escape after
+	// destruction has become observable.
+	if err := k.refuseIfDestroyed(ctx, wrapped.KEKID); err != nil {
+		return domain.DEK{}, err
+	}
 
 	dek, err := domain.DEKFrom(res.Data.Plaintext)
 	if err != nil {
@@ -370,7 +471,14 @@ func (k *KeyManager) RewrapDEK(ctx context.Context, wrapped domain.WrappedDEK) (
 	if err != nil {
 		return domain.WrappedDEK{}, k.classifyRecord(ctx, wrapped, "rewrap", err)
 	}
-	return record(wrapped.KEKID, wrapped.KeyID, res)
+	rewrapped, err := record(wrapped.KEKID, wrapped.KeyID, res)
+	if err != nil {
+		return domain.WrappedDEK{}, err
+	}
+	if err := k.refuseIfDestroyed(ctx, wrapped.KEKID); err != nil {
+		return domain.WrappedDEK{}, err
+	}
+	return rewrapped, nil
 }
 
 // RotateKEK implements keymanager.KeyManager, over transit's rotate endpoint.
@@ -393,6 +501,9 @@ func (k *KeyManager) RotateKEK(ctx context.Context, kekID domain.KEKID) (domain.
 	if err := version.Validate(); err != nil {
 		return 0, fmt.Errorf("keyring/openbaotransit: rotate %s: the server reported latest version %d: %w",
 			kekID, res.Data.LatestVersion, err)
+	}
+	if err := k.refuseIfDestroyed(ctx, kekID); err != nil {
+		return 0, err
 	}
 	return version, nil
 }
@@ -586,7 +697,8 @@ func (k *KeyManager) classifyRecord(ctx context.Context, wrapped domain.WrappedD
 }
 
 // refuseIfDestroyed returns domain.ErrKEKDestroyed if the KEK has been
-// destroyed. It is the check every write goes through before it writes.
+// destroyed. It is the check every write goes through before it writes, and
+// the post-call check that closes the destroy/wrap race.
 func (k *KeyManager) refuseIfDestroyed(ctx context.Context, kekID domain.KEKID) error {
 	destroyed, err := k.isDestroyed(ctx, kekID)
 	if err != nil {
@@ -596,6 +708,24 @@ func (k *KeyManager) refuseIfDestroyed(ctx context.Context, kekID domain.KEKID) 
 		return fmt.Errorf("%w: %s", domain.ErrKEKDestroyed, kekID)
 	}
 	return nil
+}
+
+// removeResurrectedKey is the best-effort cleanup after a wrap/datakey call
+// observes a tombstone. Transit may have recreated the key through its upsert
+// path; deleting it again preserves the “no material under a destroyed name”
+// property. A failure here is deliberately ignored: the caller already gets
+// ErrKEKDestroyed, every subsequent operation re-checks the tombstone, and a
+// retried DestroyKEK will finish the deletion.
+func (k *KeyManager) removeResurrectedKey(ctx context.Context, kekID domain.KEKID) {
+	key, err := k.readKey(ctx, keyName(kekID))
+	if err != nil {
+		return
+	}
+	allowed := true
+	latest := key.Data.LatestVersion
+	_, _ = k.call(ctx, http.MethodPost, "keys/"+keyName(kekID)+"/config",
+		&transitRequest{MinDecryptionVersion: &latest, DeletionAllowed: &allowed})
+	_, _ = k.call(ctx, http.MethodDelete, "keys/"+keyName(kekID), nil)
 }
 
 // isDestroyed reports whether this KEK's tombstone exists.
@@ -921,22 +1051,22 @@ var _ keymanager.KeyManager = (*KeyManager)(nil)
 // String renders the manager without its token. A *KeyManager is what Open
 // returns, so it is in scope wherever Open's error handling is, and its token
 // field is the credential that authenticates this process to OpenBao.
-func (k *KeyManager) String() string {
+func (k KeyManager) String() string {
 	return fmt.Sprintf("openbaotransit.KeyManager{base: %q, mount: %q, token: %s}",
 		k.base, k.mount, domain.Redacted)
 }
 
 // Format implements fmt.Formatter so that every verb yields the redacted
 // summary rather than only the five fmt routes through Stringer.
-func (k *KeyManager) Format(s fmt.State, _ rune) { _, _ = io.WriteString(s, k.String()) }
+func (k KeyManager) Format(s fmt.State, _ rune) { _, _ = io.WriteString(s, k.String()) }
 
 // MarshalJSON renders the redacted summary. encoding/json skips unexported
 // fields, so a KeyManager already marshalled to "{}" — safety by accident,
 // which ends the moment a field is exported.
-func (k *KeyManager) MarshalJSON() ([]byte, error) { return json.Marshal(k.String()) }
+func (k KeyManager) MarshalJSON() ([]byte, error) { return json.Marshal(k.String()) }
 
 // LogValue renders the manager as a slog group with the token redacted.
-func (k *KeyManager) LogValue() slog.Value {
+func (k KeyManager) LogValue() slog.Value {
 	return slog.GroupValue(
 		slog.String("address", k.base),
 		slog.String("mount_path", k.mount),
