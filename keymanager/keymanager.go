@@ -37,6 +37,14 @@ import (
 	"github.com/laenenai/keyring/internal/domain"
 )
 
+// Closer is the optional lifecycle interface an adapter implements when it
+// can release derived keys, tokens and idle connections. It is deliberately
+// not part of KeyManager: adding Close to the port would break every
+// consumer's own adapter, while an optional type assertion is additive.
+type Closer interface {
+	Close() error
+}
+
 // RewrapWithoutPlaintext is the optional capability a key manager exposes
 // when RewrapDEK can rotate a record without ever putting the DEK in this
 // process. OpenBao transit implements it; the local adapter does not, because
