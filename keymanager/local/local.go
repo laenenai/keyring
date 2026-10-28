@@ -10,8 +10,8 @@
 // key is in this process's address space, so an operator who can read the
 // process (or the file, or the environment) can read it. Everything else —
 // per-object DEKs, per-tenant KEKs, lazy rotation, crypto-shredding — is
-// identical, which is why swapping adapters later is a configuration change
-// and not a migration.
+// identical. Swapping adapters keeps the same call sites, but persisted
+// records are adapter-specific and need a side-by-side rewrap migration.
 //
 // # Wire format
 //
@@ -245,6 +245,10 @@ type keyManagerState struct {
 	closed    atomic.Bool
 	closeOnce sync.Once
 
+	// wrapKeyMu protects wrapKey against Close. Operations hold the read
+	// lock while they use the key; Close takes the write lock to zeroize it.
+	wrapKeyMu sync.RWMutex
+
 	// mu serializes the operations that create KEK versions — the implicit
 	// creation inside WrapDEK and RotateKEK — so that two goroutines in
 	// this process cannot both decide they are creating the same version.
@@ -295,16 +299,58 @@ func Open(ctx context.Context, cfg Config) (*KeyManager, error) {
 	return &KeyManager{state: &keyManagerState{wrapKey: wrapKey, store: cfg.Store, logger: cfg.Logger}}, nil
 }
 
+// CurrentKEKVersion implements keymanager.KEKVersionLister.
+func (k *KeyManager) CurrentKEKVersion(ctx context.Context, kekID domain.KEKID) (domain.KEKVersion, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, fmt.Errorf("keyring/local: current KEK version: %w", err)
+	}
+	if err := k.checkOpen(); err != nil {
+		return 0, err
+	}
+	if err := kekID.Validate(); err != nil {
+		return 0, err
+	}
+	lock := k.state.lockFor(kekID)
+	lock.RLock()
+	defer lock.RUnlock()
+	version, err := k.state.store.CurrentKEKVersion(ctx, kekID)
+	if err != nil {
+		return 0, fmt.Errorf("keyring/local: current KEK version: %w", err)
+	}
+	return version, nil
+}
+
+// ListKEKVersions implements keymanager.KEKVersionLister.
+func (k *KeyManager) ListKEKVersions(ctx context.Context, kekID domain.KEKID) ([]domain.KEKVersion, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("keyring/local: list KEK versions: %w", err)
+	}
+	if err := k.checkOpen(); err != nil {
+		return nil, err
+	}
+	if err := kekID.Validate(); err != nil {
+		return nil, err
+	}
+	lock := k.state.lockFor(kekID)
+	lock.RLock()
+	defer lock.RUnlock()
+	versions, err := k.state.store.ListKEKVersions(ctx, kekID)
+	if err != nil {
+		return nil, fmt.Errorf("keyring/local: list KEK versions: %w", err)
+	}
+	return versions, nil
+}
+
 // Close zeroizes the derived wrapping key. It is idempotent. Operations that
 // start after Close return domain.ErrClosed; Close must not race an in-flight
 // operation.
 func (k *KeyManager) Close() error {
 	k.state.closeOnce.Do(func() {
 		k.state.closed.Store(true)
-		k.state.mu.Lock()
+		k.state.wrapKeyMu.Lock()
 		clear(k.state.wrapKey)
 		k.state.wrapKey = nil
-		k.state.mu.Unlock()
+		k.state.wrapKeyMu.Unlock()
 		if k.state.logger != nil {
 			k.state.logger.Info("keyring: local key manager closed")
 		}
@@ -645,7 +691,13 @@ func (k *KeyManager) createVersion(ctx context.Context, kekID domain.KEKID, vers
 	}
 	defer clear(material)
 
+	k.state.wrapKeyMu.RLock()
+	if k.state.closed.Load() {
+		k.state.wrapKeyMu.RUnlock()
+		return domain.ErrClosed
+	}
 	wrapped, err := sealRecord(k.state.wrapKey, material, kekAAD(kekID, version))
+	k.state.wrapKeyMu.RUnlock()
 	if err != nil {
 		return fmt.Errorf("keyring/local: wrap %s %s under the root key: %w", kekID, version, err)
 	}
@@ -670,7 +722,13 @@ func (k *KeyManager) kekMaterial(ctx context.Context, kekID domain.KEKID, versio
 	if err != nil {
 		return nil, fmt.Errorf("keyring/local: read %s %s: %w", kekID, version, err)
 	}
+	k.state.wrapKeyMu.RLock()
+	if k.state.closed.Load() {
+		k.state.wrapKeyMu.RUnlock()
+		return nil, domain.ErrClosed
+	}
 	material, err := openRecord(k.state.wrapKey, wrapped, kekAAD(kekID, version))
+	k.state.wrapKeyMu.RUnlock()
 	if err != nil {
 		return nil, fmt.Errorf("%w: %s %s does not authenticate under this root key", domain.ErrUnwrapFailed, kekID, version)
 	}

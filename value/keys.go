@@ -1,4 +1,4 @@
-// Package domain is the single home for every value object keyring names:
+// Package value is the single home for every value object keyring names:
 // the data encryption key (DEK) that some caller's cipher consumes, the
 // wrapped form of that DEK which the caller persists, and the identifiers
 // that say which key encryption key (KEK) — at which version — did the
@@ -27,13 +27,14 @@
 // The root package keyring re-exports what a consumer needs to name as type
 // aliases, so a WrappedDEK an adapter returns and a keyring.WrappedDEK the
 // consumer stores are the identical type.
-package domain
+package value
 
 import (
 	"bytes"
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -331,6 +332,50 @@ type WrappedDEK struct {
 	// written by one adapter is not portable to another, and callers must
 	// not parse it.
 	Ciphertext []byte `json:"ciphertext"`
+}
+
+// UnmarshalJSON accepts both the stable field names and the legacy Go field
+// names used before the persistence contract was documented. The stable names
+// win when both are present; a record with neither shape fails Validate.
+func (w *WrappedDEK) UnmarshalJSON(data []byte) error {
+	type canonical struct {
+		KEKID      KEKID            `json:"kek_id"`
+		KEKVersion KEKVersion       `json:"kek_version"`
+		KeyID      KeyID            `json:"key_id"`
+		Format     WrappedDEKFormat `json:"format"`
+		Ciphertext []byte           `json:"ciphertext"`
+	}
+	type legacy struct {
+		KEKID      KEKID      `json:"KEKID"`
+		KEKVersion KEKVersion `json:"KEKVersion"`
+		KeyID      KeyID      `json:"KeyID"`
+		Ciphertext []byte     `json:"Ciphertext"`
+	}
+	var c canonical
+	if err := json.Unmarshal(data, &c); err != nil {
+		return fmt.Errorf("%w: %w", ErrInvalidWrappedDEK, err)
+	}
+	var l legacy
+	if err := json.Unmarshal(data, &l); err != nil {
+		return fmt.Errorf("%w: %w", ErrInvalidWrappedDEK, err)
+	}
+	if c.KEKID == "" {
+		c.KEKID = l.KEKID
+	}
+	if c.KEKVersion == 0 {
+		c.KEKVersion = l.KEKVersion
+	}
+	if c.KeyID == "" {
+		c.KeyID = l.KeyID
+	}
+	if len(c.Ciphertext) == 0 {
+		c.Ciphertext = l.Ciphertext
+	}
+	*w = WrappedDEK(c)
+	if err := w.Validate(); err != nil {
+		return fmt.Errorf("%w: %w", ErrInvalidWrappedDEK, err)
+	}
+	return nil
 }
 
 const wrappedDEKBinaryVersion byte = 1

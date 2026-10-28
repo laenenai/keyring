@@ -55,6 +55,11 @@ type KEKStore interface {
 	// domain.ErrKEKDestroyed if the KEK has been destroyed.
 	CreateKEKVersion(ctx context.Context, id domain.KEKID, version domain.KEKVersion, wrapped []byte) error
 
+	// ListKEKVersions returns every stored version of the KEK named by id,
+	// in ascending order. It returns domain.ErrKEKNotFound if the KEK has no
+	// versions, and domain.ErrKEKDestroyed if it has been destroyed.
+	ListKEKVersions(ctx context.Context, id domain.KEKID) ([]domain.KEKVersion, error)
+
 	// CurrentKEKVersion returns the highest stored version of the KEK named
 	// by id: domain.ErrKEKNotFound if it has no versions, and
 	// domain.ErrKEKDestroyed if it has been destroyed.
@@ -111,6 +116,12 @@ func (s *MemKEKStore) CreateKEKVersion(ctx context.Context, id domain.KEKID, ver
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("keyring/kekstore: create KEK version: %w", err)
 	}
+	if err := id.Validate(); err != nil {
+		return err
+	}
+	if err := version.Validate(); err != nil {
+		return err
+	}
 	if len(wrapped) == 0 {
 		return fmt.Errorf("%w: no wrapped KEK material to store", domain.ErrInvalidKeyMaterial)
 	}
@@ -118,6 +129,9 @@ func (s *MemKEKStore) CreateKEKVersion(ctx context.Context, id domain.KEKID, ver
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if s.keks == nil {
+		s.keks = make(map[domain.KEKID]*memKEK)
+	}
 	kek, ok := s.keks[id]
 	switch {
 	case ok && kek.destroyed:
@@ -152,6 +166,32 @@ func (s *MemKEKStore) CurrentKEKVersion(ctx context.Context, id domain.KEKID) (d
 		return 0, fmt.Errorf("%w: %s has no versions", domain.ErrKEKNotFound, id)
 	}
 	return slices.Max(slices.Collect(maps.Keys(kek.versions))), nil
+}
+
+// ListKEKVersions implements KEKStore.
+func (s *MemKEKStore) ListKEKVersions(ctx context.Context, id domain.KEKID) ([]domain.KEKVersion, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("keyring/kekstore: list KEK versions: %w", err)
+	}
+	if err := id.Validate(); err != nil {
+		return nil, err
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	kek, ok := s.keks[id]
+	switch {
+	case !ok:
+		return nil, fmt.Errorf("%w: %s", domain.ErrKEKNotFound, id)
+	case kek.destroyed:
+		return nil, fmt.Errorf("%w: %s", domain.ErrKEKDestroyed, id)
+	case len(kek.versions) == 0:
+		return nil, fmt.Errorf("%w: %s has no versions", domain.ErrKEKNotFound, id)
+	}
+	versions := slices.Collect(maps.Keys(kek.versions))
+	slices.Sort(versions)
+	return versions, nil
 }
 
 // WrappedKEK implements KEKStore.

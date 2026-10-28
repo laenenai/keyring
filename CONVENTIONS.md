@@ -158,8 +158,8 @@ with it.
 
 ## Package layout
 
-- All domain types and value objects live in `internal/domain` and nowhere
-  else.
+- All domain types and value objects live in the public `value` package and
+  nowhere else; `internal/domain` only aliases it for existing internal code.
 - A root facade file (`<module>.go`) re-exports what a consumer must name, as
   **type aliases** so a value the internals produce and a value the consumer
   holds are the identical type.
@@ -219,7 +219,7 @@ the other had it backwards.
     column. Typed ids survive to the boundary and a generated layer never hands
     back a bare string.
   - **A deliberately opaque type** — a struct with an unexported field, so that
-    no package outside `internal/domain` can forge or convert one, as
+    no package outside `value` can forge or convert one, as
     `iam.ClearanceGroupID` is — maps to its **primitive**, and the adapter
     converts through the validating parser (`ParseClearanceGroupID`) at its own
     boundary. One conversion per field, and the invariant is untouched.

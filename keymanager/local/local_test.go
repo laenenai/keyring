@@ -685,3 +685,33 @@ func TestCloseRejectsFurtherUseAndIsIdempotent(t *testing.T) {
 		t.Fatalf("WrapDEK after Close = %v, want ErrClosed", err)
 	}
 }
+
+func TestCloseDoesNotRaceInFlightOperations(t *testing.T) {
+	t.Parallel()
+
+	km := newKeyManager(t, randomRootKey(t), local.NewMemKEKStore())
+	closer, ok := km.(interface{ Close() error })
+	if !ok {
+		t.Fatal("local.KeyManager does not implement Close")
+	}
+	dek, err := keyring.NewDEK()
+	if err != nil {
+		t.Fatalf("NewDEK: %v", err)
+	}
+	t.Cleanup(dek.Destroy)
+
+	start := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		<-start
+		for range 100 {
+			_, _ = km.WrapDEK(context.Background(), "kek-close-race", "key-1", dek)
+		}
+	}()
+	close(start)
+	if err := closer.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	<-done
+}

@@ -38,11 +38,16 @@ release may break the API. See `UPGRADING.md` for migration steps.
   remain aliases for compatibility, but `keyringtest.RunKEKStoreSuite` now
   takes the neutral type. This removes the test suite's dependency on the
   local adapter.
+- **The public value objects moved to `github.com/laenenai/keyring/value`.**
+  `internal/domain` now aliases that package for existing internal code. The
+  root facade still exposes the identical types, and the compatibility gate
+  now sees the public `value` package rather than an internal-only alias.
 - **`WrappedDEK` has a persistence contract.** Records now carry a `Format`
   (`local/v1` or `openbao-transit/v1`), stable JSON field names and a
   versioned `MarshalBinary`/`UnmarshalBinary` encoding. Records written before
   the field existed have an empty format and remain readable; new records
-  from either adapter name their format.
+  from either adapter name their format. JSON decoding accepts both the stable
+  and legacy field names.
 - **`RewrapWithoutPlaintext` is an optional capability.** The OpenBao adapter
   implements it; the local adapter does not claim it, because a local rewrap
   necessarily decrypts in-process.
@@ -75,7 +80,8 @@ release may break the API. See `UPGRADING.md` for migration steps.
 
 - Adapters implement the optional `keyring.Closer`: `Close` zeroizes the
   local wrapping key, clears the transit token and closes idle connections.
-  Both adapters accept an optional `*slog.Logger` for lifecycle events.
+  Close is synchronized with in-flight operations. Both adapters accept an
+  optional `*slog.Logger` for lifecycle events.
 - The local adapter has a committed v1 wire-format fixture and both record
   parsers have fuzz targets; the binary `WrappedDEK` decoder has one too.
 

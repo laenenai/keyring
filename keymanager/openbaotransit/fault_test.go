@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -192,5 +193,64 @@ func TestTransientErrorReportsRetryAfter(t *testing.T) {
 	}
 	if got := retryAfter.RetryAfter(); got != 2*time.Second {
 		t.Fatalf("RetryAfter = %s, want 2s", got)
+	}
+}
+
+func TestOversizedResponseIsRejected(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(strings.Repeat("x", (1<<20)+1)))
+	}))
+	t.Cleanup(server.Close)
+
+	km := newFaultManager(t, server, openbaotransit.RetryPolicy{MaxAttempts: 1})
+	_, err := km.RotateKEK(context.Background(), "kek-1")
+	if err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("RotateKEK(oversized response) = %v, want an exceeds error", err)
+	}
+}
+
+func TestMalformedSuccessBodyIsNotRetried(t *testing.T) {
+	t.Parallel()
+
+	var attempts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		attempts.Add(1)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("{"))
+	}))
+	t.Cleanup(server.Close)
+
+	km := newFaultManager(t, server, openbaotransit.RetryPolicy{MaxAttempts: 3})
+	if _, err := km.RotateKEK(context.Background(), "kek-1"); err == nil {
+		t.Fatal("RotateKEK(malformed body) returned nil error")
+	}
+	if got := attempts.Load(); got != 1 {
+		t.Fatalf("attempts = %d, want 1 (malformed 2xx is not retried)", got)
+	}
+}
+
+func TestTokenHeaderIsSent(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("X-Vault-Token"); got != "test-token" {
+			t.Errorf("X-Vault-Token = %q, want test-token", got)
+			http.Error(w, `{"errors":["permission denied"]}`, http.StatusForbidden)
+			return
+		}
+		if r.Method == http.MethodGet {
+			http.Error(w, `{"errors":["key not found"]}`, http.StatusNotFound)
+			return
+		}
+		_, _ = w.Write([]byte(`{"data":{"latest_version":2}}`))
+	}))
+	t.Cleanup(server.Close)
+
+	km := newFaultManager(t, server, openbaotransit.RetryPolicy{MaxAttempts: 1})
+	if _, err := km.RotateKEK(context.Background(), "kek-1"); err != nil {
+		t.Fatalf("RotateKEK: %v", err)
 	}
 }

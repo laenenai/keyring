@@ -49,6 +49,9 @@ func TestPostgresStoreConforms(t *testing.T) {
 	if err := store.Migrate(ctx); err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatalf("second Migrate: %v", err)
+	}
 
 	keyringtest.RunKEKStoreSuite(t, func(_ *testing.T) kekstore.KEKStore {
 		return store

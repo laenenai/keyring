@@ -92,15 +92,19 @@ store := kekstore.NewMemKEKStore() // tests only
 `keyringtest.RunKEKStoreSuite` now accepts `kekstore.KEKStore`; callers passing
 a `local.KEKStore` function value need no change because the type is an alias.
 
+The public value objects now also live at `github.com/laenenai/keyring/value`.
+`internal/domain` aliases that package for existing internal code, and the
+root `keyring` aliases are unchanged.
+
 ### 8. Persist records with the versioned format
 
-New wrapped records carry `Format`. JSON field names are now stable
-(`kek_id`, `kek_version`, `key_id`, `format`, `ciphertext`); if you stored the
-old Go field names, migrate the values or decode both shapes. Prefer
-`WrappedDEK.MarshalBinary`/`UnmarshalBinary` for new storage. An empty
-`Format` is treated as a legacy record and remains readable; an adapter
-rejects a record whose non-empty format belongs to another adapter with
-`ErrInvalidWrappedDEK`.
+New wrapped records carry `Format`. JSON encoding uses stable field names
+(`kek_id`, `kek_version`, `key_id`, `format`, `ciphertext`); decoding accepts
+both those and the old Go field names, so existing JSON records remain
+readable. Prefer `WrappedDEK.MarshalBinary`/`UnmarshalBinary` for new storage.
+An empty `Format` is treated as a legacy record and remains readable; an
+adapter rejects a record whose non-empty format belongs to another adapter
+with `ErrInvalidWrappedDEK`.
 
 ### 9. Use the optional rewrap capability
 

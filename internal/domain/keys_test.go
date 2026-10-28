@@ -490,3 +490,19 @@ func TestWrappedDEKRendersTheAdapterFormat(t *testing.T) {
 		t.Fatalf("WrappedDEK rendering %q does not name its format", rendered)
 	}
 }
+
+func TestWrappedDEKUnmarshalJSONAcceptsLegacyFieldNames(t *testing.T) {
+	t.Parallel()
+
+	const legacy = `{"KEKID":"kek-1","KEKVersion":3,"KeyID":"blob-1","Ciphertext":"AQID"}`
+	var w domain.WrappedDEK
+	if err := json.Unmarshal([]byte(legacy), &w); err != nil {
+		t.Fatalf("unmarshal legacy WrappedDEK: %v", err)
+	}
+	if err := w.Validate(); err != nil {
+		t.Fatalf("legacy WrappedDEK did not validate: %v", err)
+	}
+	if w.KEKID != "kek-1" || w.KEKVersion != 3 || w.KeyID != "blob-1" || !bytes.Equal(w.Ciphertext, []byte{1, 2, 3}) {
+		t.Fatalf("legacy WrappedDEK = %+v", w)
+	}
+}

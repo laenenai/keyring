@@ -156,6 +156,31 @@ func RunKEKStoreSuite(t *testing.T, newStore func(t *testing.T) kekstore.KEKStor
 		}
 	})
 
+	t.Run("ListKEKVersionsIsAscending", func(t *testing.T) {
+		store := newStore(t)
+		ctx := context.Background()
+		id := newKEKID(t)
+		material := []byte("material")
+		for _, version := range []keyring.KEKVersion{3, 1, 2} {
+			if err := store.CreateKEKVersion(ctx, id, version, material); err != nil {
+				t.Fatalf("CreateKEKVersion(%s): %v", version, err)
+			}
+		}
+		versions, err := store.ListKEKVersions(ctx, id)
+		if err != nil {
+			t.Fatalf("ListKEKVersions: %v", err)
+		}
+		want := []keyring.KEKVersion{1, 2, 3}
+		if len(versions) != len(want) {
+			t.Fatalf("ListKEKVersions = %v, want %v", versions, want)
+		}
+		for i := range want {
+			if versions[i] != want[i] {
+				t.Fatalf("ListKEKVersions = %v, want %v", versions, want)
+			}
+		}
+	})
+
 	// DestructionIsTerminal is the store's half of crypto-shredding. The
 	// material must be gone rather than flagged, and the fact must outlive it:
 	// every method naming a destroyed KEK answers ErrKEKDestroyed forever,

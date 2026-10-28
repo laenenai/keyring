@@ -1,11 +1,12 @@
 // Package openbaotransit is the OpenBao transit adapter: the recommended
 // production key manager, in which the root key never exists in this
 // process's address space at all. The application sends a DEK to be wrapped
-// and receives it back wrapped, every wrap and unwrap lands in OpenBao's
-// audit log, rotation is a server-side operation, and destroying a key is
-// enforced by something outside the application that is holding it (CAS
-// design §8.3). HashiCorp Vault's transit engine is wire-compatible, so the
-// same adapter serves both.
+// and receives it back wrapped; when an audit device is configured, the
+// request lands in OpenBao's audit log. Rotation is a server-side operation,
+// and destroying a key is enforced by something outside the application
+// holding it (CAS design §8.3). OpenBao 2.2.x is the tested server; the
+// ciphertext prefix reader also accepts Vault's spelling, but Vault has not
+// been tested as a server matrix.
 //
 // Transit is a plain JSON HTTP API, so this package speaks it with the
 // standard library's net/http and no SDK. That is a deliberate choice and
@@ -127,7 +128,10 @@ const transitKeyType = "aes256-gcm96"
 // maxResponseBytes bounds how much of a response this adapter reads. Every
 // response it expects is a few hundred bytes; the limit is what stops a
 // misconfigured address pointing at something that streams.
-const maxResponseBytes = 1 << 20
+const (
+	maxResponseBytes     = 1 << 20
+	maxErrorMessageBytes = 512
+)
 
 // ciphertextPrefixes are the leading field a transit ciphertext may carry
 // ("vault:v1:…"). OpenBao still emits Vault's; both are accepted so that a
@@ -281,6 +285,8 @@ type KeyManager struct {
 	// by a value copy.
 	closed    *atomic.Bool
 	closeOnce *sync.Once
+	// tokenMu protects token against Close while a request is being built.
+	tokenMu *sync.RWMutex
 }
 
 func (k *KeyManager) lockFor(id domain.KEKID) *sync.RWMutex {
@@ -361,7 +367,64 @@ func Open(ctx context.Context, cfg Config) (*KeyManager, error) {
 		logger:    cfg.Logger,
 		closed:    &atomic.Bool{},
 		closeOnce: &sync.Once{},
+		tokenMu:   &sync.RWMutex{},
 	}, nil
+}
+
+// CurrentKEKVersion implements keymanager.KEKVersionLister.
+func (k *KeyManager) CurrentKEKVersion(ctx context.Context, kekID domain.KEKID) (domain.KEKVersion, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, fmt.Errorf("keyring/openbaotransit: current KEK version: %w", err)
+	}
+	if err := k.checkOpen(); err != nil {
+		return 0, err
+	}
+	if err := kekID.Validate(); err != nil {
+		return 0, err
+	}
+	res, err := k.readKey(ctx, keyName(kekID))
+	if err != nil {
+		return 0, fmt.Errorf("keyring/openbaotransit: current KEK version for %s: %w", kekID, err)
+	}
+	version := domain.KEKVersion(res.Data.LatestVersion)
+	if err := version.Validate(); err != nil {
+		return 0, err
+	}
+	return version, nil
+}
+
+// ListKEKVersions implements keymanager.KEKVersionLister.
+func (k *KeyManager) ListKEKVersions(ctx context.Context, kekID domain.KEKID) ([]domain.KEKVersion, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("keyring/openbaotransit: list KEK versions: %w", err)
+	}
+	if err := k.checkOpen(); err != nil {
+		return nil, err
+	}
+	if err := kekID.Validate(); err != nil {
+		return nil, err
+	}
+	res, err := k.readKey(ctx, keyName(kekID))
+	if err != nil {
+		return nil, fmt.Errorf("keyring/openbaotransit: list KEK versions for %s: %w", kekID, err)
+	}
+	versions := make([]domain.KEKVersion, 0, len(res.Data.Keys))
+	for raw := range res.Data.Keys {
+		n, err := strconv.ParseUint(raw, 10, 32)
+		if err != nil || n == 0 {
+			return nil, fmt.Errorf("keyring/openbaotransit: %s reported an invalid key version %q", kekID, raw)
+		}
+		versions = append(versions, domain.KEKVersion(n))
+	}
+	if len(versions) == 0 {
+		version := domain.KEKVersion(res.Data.LatestVersion)
+		if err := version.Validate(); err != nil {
+			return nil, err
+		}
+		versions = append(versions, version)
+	}
+	slices.Sort(versions)
+	return versions, nil
 }
 
 // Close releases the token and idle HTTP connections. It is idempotent.
@@ -370,7 +433,9 @@ func Open(ctx context.Context, cfg Config) (*KeyManager, error) {
 func (k *KeyManager) Close() error {
 	k.closeOnce.Do(func() {
 		k.closed.Store(true)
+		k.tokenMu.Lock()
 		k.token = ""
+		k.tokenMu.Unlock()
 		k.client.CloseIdleConnections()
 		if k.logger != nil {
 			k.logger.Info("keyring: OpenBao transit key manager closed")
@@ -641,10 +706,9 @@ func (k *KeyManager) RotateKEK(ctx context.Context, kekID domain.KEKID) (domain.
 // ErrKEKDestroyed promises.
 //
 // Deleting the key erases. DELETE keys/<name> removes every version's
-// material, which is what makes the DEKs wrapped under it permanently
-// unwrappable and so makes the content those DEKs encrypted permanently
-// unreadable in every backup and archive tier that still holds the
-// ciphertext. Transit requires deletion_allowed on the key first, which is
+// material, which makes the DEKs wrapped under it unwrappable in the live
+// system. Backups, snapshots and object-store versions are outside this
+// guarantee; see SECURITY.md. Transit requires deletion_allowed on the key first, which is
 // why this method sets it rather than requiring an operator to have done so
 // in advance for keys they may never destroy.
 //
@@ -1034,7 +1098,14 @@ func (k *KeyManager) callOnce(ctx context.Context, method, path string, encoded 
 	if err != nil {
 		return nil, fmt.Errorf("keyring/openbaotransit: build a %s request: %w", method, err)
 	}
-	req.Header.Set("X-Vault-Token", k.token)
+	k.tokenMu.RLock()
+	if k.closed != nil && k.closed.Load() {
+		k.tokenMu.RUnlock()
+		return nil, domain.ErrClosed
+	}
+	token := k.token
+	k.tokenMu.RUnlock()
+	req.Header.Set("X-Vault-Token", token)
 	if encoded != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -1047,11 +1118,14 @@ func (k *KeyManager) callOnce(ctx context.Context, method, path string, encoded 
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
 	if err != nil {
 		return nil, &transportError{err: fmt.Errorf("keyring/openbaotransit: read the response to %s: %w", method, err)}
 	}
 	defer clear(raw)
+	if len(raw) > maxResponseBytes {
+		return nil, fmt.Errorf("keyring/openbaotransit: response to %s exceeds %d bytes", method, maxResponseBytes)
+	}
 
 	ok := resp.StatusCode >= 200 && resp.StatusCode <= 299
 	var decoded transitResponse
@@ -1121,10 +1195,11 @@ type transitRequest struct {
 // owns and can zeroize.
 type transitResponse struct {
 	Data struct {
-		Ciphertext    string `json:"ciphertext"`
-		Plaintext     []byte `json:"plaintext"`
-		KeyVersion    uint32 `json:"key_version"`
-		LatestVersion uint32 `json:"latest_version"`
+		Ciphertext    string           `json:"ciphertext"`
+		Plaintext     []byte           `json:"plaintext"`
+		KeyVersion    uint32           `json:"key_version"`
+		LatestVersion uint32           `json:"latest_version"`
+		Keys          map[string]int64 `json:"keys"`
 	} `json:"data"`
 	Errors []string `json:"errors"`
 }
@@ -1148,7 +1223,14 @@ func (e *apiError) Error() string {
 	if len(e.messages) == 0 {
 		return "openbao transit returned HTTP " + strconv.Itoa(e.status)
 	}
-	return "openbao transit returned HTTP " + strconv.Itoa(e.status) + ": " + strings.Join(e.messages, "; ")
+	messages := make([]string, len(e.messages))
+	for i, message := range e.messages {
+		if len(message) > maxErrorMessageBytes {
+			message = message[:maxErrorMessageBytes] + "…"
+		}
+		messages[i] = message
+	}
+	return "openbao transit returned HTTP " + strconv.Itoa(e.status) + ": " + strings.Join(messages, "; ")
 }
 
 // says reports whether any of the server's messages contains substring.

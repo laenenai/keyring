@@ -63,8 +63,18 @@ func New(db *sql.DB) *Store { return &Store{db: db} }
 // Close closes the underlying connection pool.
 func (s *Store) Close() error { return s.db.Close() }
 
-// Migrate creates the store's tables. It is safe to run repeatedly.
+// Migrate creates the store's tables. It is safe to run repeatedly and from
+// concurrent replicas; the advisory lock serializes startup migrations.
 func (s *Store) Migrate(ctx context.Context) error {
+	const migrationLockID int64 = 0x6b657972696e67 // "keyring"
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("keyring/postgres: begin migrate: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock($1)`, migrationLockID); err != nil {
+		return fmt.Errorf("keyring/postgres: lock migrations: %w", err)
+	}
 	for _, statement := range []string{
 		`CREATE TABLE IF NOT EXISTS keyring_keks (
 			id text PRIMARY KEY,
@@ -77,9 +87,12 @@ func (s *Store) Migrate(ctx context.Context) error {
 			PRIMARY KEY (kek_id, version)
 		)`,
 	} {
-		if _, err := s.db.ExecContext(ctx, statement); err != nil {
+		if _, err := tx.ExecContext(ctx, statement); err != nil {
 			return fmt.Errorf("keyring/postgres: migrate: %w", err)
 		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("keyring/postgres: commit migrate: %w", err)
 	}
 	return nil
 }
@@ -171,6 +184,61 @@ func (s *Store) CurrentKEKVersion(ctx context.Context, id domain.KEKID) (domain.
 		return 0, fmt.Errorf("%w: %s has no usable versions", domain.ErrKEKNotFound, id)
 	}
 	return domain.KEKVersion(*current), nil
+}
+
+// ListKEKVersions implements kekstore.KEKStore.
+func (s *Store) ListKEKVersions(ctx context.Context, id domain.KEKID) ([]domain.KEKVersion, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("keyring/postgres: list KEK versions: %w", err)
+	}
+	if err := id.Validate(); err != nil {
+		return nil, err
+	}
+
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT k.destroyed_at, v.version
+		FROM keyring_keks AS k
+		LEFT JOIN keyring_kek_versions AS v ON v.kek_id = k.id
+		WHERE k.id = $1
+		ORDER BY v.version`, string(id))
+	if err != nil {
+		return nil, fmt.Errorf("keyring/postgres: list KEK versions: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var destroyedAt *time.Time
+	var versions []domain.KEKVersion
+	found := false
+	for rows.Next() {
+		found = true
+		var destroyed *time.Time
+		var version *int64
+		if err := rows.Scan(&destroyed, &version); err != nil {
+			return nil, fmt.Errorf("keyring/postgres: scan KEK version: %w", err)
+		}
+		if destroyed != nil {
+			destroyedAt = destroyed
+		}
+		if version != nil {
+			if *version <= 0 || *version > math.MaxUint32 {
+				return nil, fmt.Errorf("%w: %s has an invalid stored version", domain.ErrKEKNotFound, id)
+			}
+			versions = append(versions, domain.KEKVersion(*version))
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("keyring/postgres: list KEK versions: %w", err)
+	}
+	if !found {
+		return nil, fmt.Errorf("%w: %s", domain.ErrKEKNotFound, id)
+	}
+	if destroyedAt != nil {
+		return nil, fmt.Errorf("%w: %s", domain.ErrKEKDestroyed, id)
+	}
+	if len(versions) == 0 {
+		return nil, fmt.Errorf("%w: %s has no versions", domain.ErrKEKNotFound, id)
+	}
+	return versions, nil
 }
 
 // WrappedKEK implements kekstore.KEKStore.

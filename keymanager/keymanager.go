@@ -26,7 +26,7 @@
 // adapter, may contain key material in any encoding — raw, hex, or base64.
 // Identifiers (a KEK id, a key id, a version) are not secret and may appear;
 // the material never may. See keyringtest's NoKeyMaterialLeaksInErrors
-// subtest, which every adapter exercises, and domain.DEK's redacted
+// subtest, which every adapter exercises, and value.DEK's redacted
 // renderings, which
 // make the common mistake impossible rather than merely forbidden.
 package keymanager
@@ -36,6 +36,16 @@ import (
 
 	"github.com/laenenai/keyring/internal/domain"
 )
+
+// KEKVersionLister is the optional version-lifecycle interface. It exposes
+// the current version and every stored version without adding methods to the
+// KeyManager port. Per-version retirement is deliberately not part of this
+// interface yet; a store that needs it should expose a separate, reviewed
+// operation with a "no records remain" precondition.
+type KEKVersionLister interface {
+	CurrentKEKVersion(ctx context.Context, kekID domain.KEKID) (domain.KEKVersion, error)
+	ListKEKVersions(ctx context.Context, kekID domain.KEKID) ([]domain.KEKVersion, error)
+}
 
 // Closer is the optional lifecycle interface an adapter implements when it
 // can release derived keys, tokens and idle connections. It is deliberately
@@ -64,7 +74,7 @@ type RewrapWithoutPlaintext interface {
 //
 // Three levels of key exist (CAS design §8.3): a deployment root key, a KEK
 // per unit of isolation, and a DEK per encrypted object. Only the third ever
-// crosses this interface. A caller mints a DEK with domain.NewDEK, encrypts
+// crosses this interface. A caller mints a DEK with keyring.NewDEK, encrypts
 // with it, wraps it here, stores the WrappedDEK next to the ciphertext, and
 // destroys its copy of the DEK; to read, it unwraps and destroys again.
 //
@@ -139,9 +149,9 @@ type KeyManager interface {
 	//
 	// It returns:
 	//   - ErrKEKDestroyed if the named KEK has been destroyed. This is
-	//     permanent and is the point of crypto-shredding: the content those
-	//     DEKs encrypted is unreadable in every backup, archive tier and
-	//     object-store version that still holds it.
+	//     permanent in the live system and is the point of crypto-shredding.
+	//     Backups, snapshots, object-store versions and the root key are out
+	//     of scope: a restored wrapped KEK plus the root key can recover it.
 	//   - ErrKEKNotFound if the named KEK, or that version of it, never
 	//     existed.
 	//   - ErrUnwrapFailed if the record does not authenticate under the KEK
@@ -162,8 +172,10 @@ type KeyManager interface {
 	// re-encrypted: this is CAS design §8.3's "KEK rotation is lazy
 	// re-wrapping rather than re-encrypting content", as one operation.
 	//
-	// It is a first-class method and MUST NOT be implemented as unwrap
-	// followed by wrap, because the difference is the whole reason it exists.
+	// It is a first-class method. An adapter whose backend can rewrap without
+	// returning plaintext MUST NOT implement it as unwrap followed by wrap,
+	// because that difference is the whole reason the optional
+	// RewrapWithoutPlaintext capability exists.
 	// OpenBao transit's rewrap endpoint documents that plaintext is never
 	// returned, which is what makes it safe to delegate a rotation sweep to
 	// something that is not trusted to read the keys it is migrating: the job

@@ -45,7 +45,6 @@ func TestWireFormatGolden(t *testing.T) {
 		KEKID:      "kek-golden",
 		KEKVersion: keyring.FirstKEKVersion,
 		KeyID:      "key-golden",
-		Format:     keyring.WrappedDEKFormatLocal,
 		Ciphertext: dekRecord,
 	})
 	if err != nil {
