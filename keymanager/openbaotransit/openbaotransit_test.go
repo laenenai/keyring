@@ -741,3 +741,22 @@ func assertNoMaterial(t *testing.T, label string, text, material []byte) {
 		}
 	}
 }
+
+func TestWrongAdapterFormatIsRejectedWithoutTheServer(t *testing.T) {
+	t.Parallel()
+
+	km := unreachableKeyManager(t)
+	record := keyring.WrappedDEK{
+		KEKID:      "k",
+		KEKVersion: keyring.FirstKEKVersion,
+		KeyID:      "key",
+		Format:     keyring.WrappedDEKFormatLocal,
+		Ciphertext: []byte("vault:v1:Zm9v"),
+	}
+	if _, err := km.UnwrapDEK(context.Background(), record); !errors.Is(err, keyring.ErrInvalidWrappedDEK) {
+		t.Fatalf("UnwrapDEK(wrong format) = %v, want ErrInvalidWrappedDEK", err)
+	}
+	if _, err := km.RewrapDEK(context.Background(), record); !errors.Is(err, keyring.ErrInvalidWrappedDEK) {
+		t.Fatalf("RewrapDEK(wrong format) = %v, want ErrInvalidWrappedDEK", err)
+	}
+}

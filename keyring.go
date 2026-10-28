@@ -51,6 +51,10 @@ type (
 	// keymanager.KeyManager, and keymanager.RunKeyManagerSuite for the
 	// authoritative contract.
 	KeyManager = keymanager.KeyManager
+	// RewrapWithoutPlaintext is the optional capability for adapters whose
+	// RewrapDEK never puts the DEK in this process. See
+	// keymanager.RewrapWithoutPlaintext.
+	RewrapWithoutPlaintext = keymanager.RewrapWithoutPlaintext
 
 	// DEK is one data encryption key, zeroizable and non-rendering. See
 	// domain.DEK.
@@ -58,6 +62,9 @@ type (
 	// WrappedDEK is a DEK encrypted under a KEK, recording which KEK
 	// version wrapped it. See domain.WrappedDEK.
 	WrappedDEK = domain.WrappedDEK
+	// WrappedDEKFormat names the adapter and record format that produced a
+	// WrappedDEK. See domain.WrappedDEKFormat.
+	WrappedDEKFormat = domain.WrappedDEKFormat
 	// KEKID names a key encryption key. See domain.KEKID.
 	KEKID = domain.KEKID
 	// KeyID names what a DEK protects, and is bound into the wrapped
@@ -76,6 +83,13 @@ const (
 	// Redacted is the placeholder every rendering of key material yields.
 	// See domain.Redacted.
 	Redacted = domain.Redacted
+	// WrappedDEKFormatLegacy is an empty legacy format. New records name
+	// their adapter. See domain.WrappedDEKFormatLegacy.
+	WrappedDEKFormatLegacy = domain.WrappedDEKFormatLegacy
+	// WrappedDEKFormatLocal is the local adapter's record format.
+	WrappedDEKFormatLocal = domain.WrappedDEKFormatLocal
+	// WrappedDEKFormatOpenBaoTransit is the OpenBao transit record format.
+	WrappedDEKFormatOpenBaoTransit = domain.WrappedDEKFormatOpenBaoTransit
 )
 
 // Sentinel errors returned across every package boundary in keyring. See

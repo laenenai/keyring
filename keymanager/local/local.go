@@ -306,6 +306,7 @@ func (k *KeyManager) WrapDEK(ctx context.Context, kekID domain.KEKID, keyID doma
 		KEKID:      kekID,
 		KEKVersion: version,
 		KeyID:      keyID,
+		Format:     domain.WrappedDEKFormatLocal,
 		Ciphertext: ciphertext,
 	}, nil
 }
@@ -353,6 +354,9 @@ func (k *KeyManager) UnwrapDEK(ctx context.Context, wrapped domain.WrappedDEK) (
 	if err := wrapped.Validate(); err != nil {
 		return domain.DEK{}, err
 	}
+	if err := wrapped.ValidateFormat(domain.WrappedDEKFormatLocal); err != nil {
+		return domain.DEK{}, err
+	}
 
 	material, err := k.kekMaterial(ctx, wrapped.KEKID, wrapped.KEKVersion)
 	if err != nil {
@@ -397,6 +401,9 @@ func (k *KeyManager) RewrapDEK(ctx context.Context, wrapped domain.WrappedDEK) (
 		return domain.WrappedDEK{}, fmt.Errorf("keyring/local: rewrap DEK: %w", err)
 	}
 	if err := wrapped.Validate(); err != nil {
+		return domain.WrappedDEK{}, err
+	}
+	if err := wrapped.ValidateFormat(domain.WrappedDEKFormatLocal); err != nil {
 		return domain.WrappedDEK{}, err
 	}
 
@@ -446,6 +453,7 @@ func (k *KeyManager) RewrapDEK(ctx context.Context, wrapped domain.WrappedDEK) (
 		KEKID:      wrapped.KEKID,
 		KEKVersion: current,
 		KeyID:      wrapped.KeyID,
+		Format:     domain.WrappedDEKFormatLocal,
 		Ciphertext: ciphertext,
 	}, nil
 }

@@ -1,3 +1,4 @@
+// Package kekstore defines the persistence port for wrapped KEK material.
 package kekstore
 
 import (

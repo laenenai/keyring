@@ -33,6 +33,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"crypto/subtle"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"log/slog"
@@ -271,9 +272,38 @@ func (k *DEK) UnmarshalJSON([]byte) error {
 	return fmt.Errorf("%w: a DEK cannot be deserialized; unwrap a WrappedDEK instead", ErrInvalidKeyMaterial)
 }
 
+// WrappedDEKFormat names the adapter and record layout that produced a
+// WrappedDEK. The version is part of the value, so a future layout is a new
+// format rather than a silent reinterpretation of old records.
+type WrappedDEKFormat string
+
+const (
+	// WrappedDEKFormatLegacy is a record written before adapters recorded
+	// their format. It is readable for backward compatibility but new
+	// records must name their adapter.
+	WrappedDEKFormatLegacy WrappedDEKFormat = ""
+
+	// WrappedDEKFormatLocal is the local AES-GCM adapter's record format.
+	WrappedDEKFormatLocal WrappedDEKFormat = "local/v1"
+
+	// WrappedDEKFormatOpenBaoTransit is the OpenBao transit adapter's
+	// record format.
+	WrappedDEKFormatOpenBaoTransit WrappedDEKFormat = "openbao-transit/v1"
+)
+
 // WrappedDEK is a DEK encrypted under a KEK, in the form a caller persists
 // next to the content that DEK encrypted. Every field is safe to store and
 // to log; none of them is key material.
+//
+// # Persistence
+//
+// The JSON field names and the binary encoding below are a compatibility
+// contract. New records name the adapter and format that produced them in
+// Format; an empty Format is a legacy record written before the field
+// existed. A record from one adapter is not portable to another: the format
+// exists so a mixed store can reject the wrong adapter explicitly instead of
+// failing in an opaque decrypt. See MarshalBinary for the versioned binary
+// form and UPGRADING.md for the migration.
 //
 // KEKVersion is the field that makes KEK rotation cheap, and it is a hard
 // requirement rather than a convenience: because each wrapped DEK records
@@ -284,20 +314,121 @@ func (k *DEK) UnmarshalJSON([]byte) error {
 // to rotate a key.
 type WrappedDEK struct {
 	// KEKID names the KEK that can unwrap this record.
-	KEKID KEKID
+	KEKID KEKID `json:"kek_id"`
 	// KEKVersion names which version of that KEK did the wrapping. A
 	// wrapped DEK remains unwrappable at its own version after the KEK has
 	// rotated past it.
-	KEKVersion KEKVersion
+	KEKVersion KEKVersion `json:"kek_version"`
 	// KeyID is the label the DEK was wrapped against, and it is bound into
 	// the ciphertext: unwrapping a record whose KeyID has been changed
 	// fails with ErrUnwrapFailed rather than returning a key.
-	KeyID KeyID
+	KeyID KeyID `json:"key_id"`
+	// Format names the adapter and record format that produced Ciphertext.
+	// Empty means a legacy record from before this field existed.
+	Format WrappedDEKFormat `json:"format"`
 	// Ciphertext is the adapter's opaque wrapped-key blob. Its layout is an
 	// adapter's business (the local adapter documents its own), so a record
 	// written by one adapter is not portable to another, and callers must
 	// not parse it.
-	Ciphertext []byte
+	Ciphertext []byte `json:"ciphertext"`
+}
+
+const wrappedDEKBinaryVersion byte = 1
+
+// MarshalBinary returns the versioned persistence encoding of w. The first
+// byte is the encoding version; identifiers, format and ciphertext are
+// length-prefixed so the result is self-delimiting and a truncated record is
+// rejected rather than silently accepted.
+func (w WrappedDEK) MarshalBinary() ([]byte, error) {
+	if err := w.Validate(); err != nil {
+		return nil, err
+	}
+	if uint64(len(w.Ciphertext)) > uint64(^uint32(0)) {
+		return nil, fmt.Errorf("%w: ciphertext too large for the binary format", ErrInvalidWrappedDEK)
+	}
+	out := []byte{wrappedDEKBinaryVersion}
+	out = appendWrappedDEKField(out, []byte(w.KEKID))
+	out = binary.BigEndian.AppendUint32(out, uint32(w.KEKVersion))
+	out = appendWrappedDEKField(out, []byte(w.KeyID))
+	out = appendWrappedDEKField(out, []byte(w.Format))
+	out = appendWrappedDEKField(out, w.Ciphertext)
+	return out, nil
+}
+
+// UnmarshalBinary decodes the versioned persistence encoding produced by
+// MarshalBinary. It rejects unknown versions, truncated fields, trailing
+// bytes, and records that fail Validate.
+func (w *WrappedDEK) UnmarshalBinary(data []byte) error {
+	if len(data) < 1 || data[0] != wrappedDEKBinaryVersion {
+		return fmt.Errorf("%w: unknown binary format version", ErrInvalidWrappedDEK)
+	}
+	rest := data[1:]
+	var kekID, keyID, format, ciphertext []byte
+	var err error
+	if kekID, rest, err = readWrappedDEKField(rest); err != nil {
+		return err
+	}
+	if len(rest) < 4 {
+		return fmt.Errorf("%w: missing KEK version", ErrInvalidWrappedDEK)
+	}
+	version := KEKVersion(binary.BigEndian.Uint32(rest[:4]))
+	rest = rest[4:]
+	if keyID, rest, err = readWrappedDEKField(rest); err != nil {
+		return err
+	}
+	if format, rest, err = readWrappedDEKField(rest); err != nil {
+		return err
+	}
+	if ciphertext, rest, err = readWrappedDEKField(rest); err != nil {
+		return err
+	}
+	if len(rest) != 0 {
+		return fmt.Errorf("%w: trailing bytes", ErrInvalidWrappedDEK)
+	}
+	*w = WrappedDEK{
+		KEKID:      KEKID(kekID),
+		KEKVersion: version,
+		KeyID:      KeyID(keyID),
+		Format:     WrappedDEKFormat(format),
+		Ciphertext: bytes.Clone(ciphertext),
+	}
+	if err := w.Validate(); err != nil {
+		return fmt.Errorf("%w: %w", ErrInvalidWrappedDEK, err)
+	}
+	return nil
+}
+
+func appendWrappedDEKField(dst, field []byte) []byte {
+	// Field lengths are bounded by the caller's record; a >4 GiB field is
+	// not a wrapped DEK and cannot be represented by this encoding.
+	//nolint:gosec // see the <= math.MaxUint32 guard in MarshalBinary.
+	dst = binary.BigEndian.AppendUint32(dst, uint32(len(field)))
+	return append(dst, field...)
+}
+
+func readWrappedDEKField(data []byte) ([]byte, []byte, error) {
+	if len(data) < 4 {
+		return nil, nil, fmt.Errorf("%w: truncated field length", ErrInvalidWrappedDEK)
+	}
+	n := binary.BigEndian.Uint32(data[:4])
+	data = data[4:]
+	if uint64(n) > uint64(len(data)) {
+		return nil, nil, fmt.Errorf("%w: truncated field", ErrInvalidWrappedDEK)
+	}
+	return data[:n], data[n:], nil
+}
+
+// ValidateFormat reports whether w can be handled by an adapter whose record
+// format is expected. A legacy record with an empty Format is accepted so
+// records written before adapters recorded their format remain readable. A
+// non-empty format from a different adapter is ErrInvalidWrappedDEK, which is
+// clearer than sending another adapter's ciphertext to a backend that will
+// eventually fail to decrypt it.
+func (w WrappedDEK) ValidateFormat(expected WrappedDEKFormat) error {
+	if w.Format == WrappedDEKFormatLegacy || w.Format == expected {
+		return nil
+	}
+	return fmt.Errorf("%w: record format %q, want %q", ErrInvalidWrappedDEK, w.Format, expected)
 }
 
 // Validate reports whether w is structurally usable: its identifiers are
@@ -326,8 +457,8 @@ func (w WrappedDEK) Validate() error {
 // a type that prints a key-shaped blob invites a reader to assume the other
 // one does too.
 func (w WrappedDEK) String() string {
-	return fmt.Sprintf("WrappedDEK(kek=%s %s key=%s ciphertext=%d bytes)",
-		w.KEKID, w.KEKVersion, w.KeyID, len(w.Ciphertext))
+	return fmt.Sprintf("WrappedDEK(kek=%s %s key=%s format=%s ciphertext=%d bytes)",
+		w.KEKID, w.KEKVersion, w.KeyID, w.Format, len(w.Ciphertext))
 }
 
 // LogValue renders the same fields as String as a slog group, so an adapter
@@ -337,6 +468,7 @@ func (w WrappedDEK) LogValue() slog.Value {
 		slog.String("kek_id", string(w.KEKID)),
 		slog.Uint64("kek_version", uint64(w.KEKVersion)),
 		slog.String("key_id", string(w.KeyID)),
+		slog.String("format", string(w.Format)),
 		slog.Int("ciphertext_bytes", len(w.Ciphertext)),
 	)
 }

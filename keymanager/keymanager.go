@@ -37,6 +37,19 @@ import (
 	"github.com/laenenai/keyring/internal/domain"
 )
 
+// RewrapWithoutPlaintext is the optional capability a key manager exposes
+// when RewrapDEK can rotate a record without ever putting the DEK in this
+// process. OpenBao transit implements it; the local adapter does not, because
+// its KEK material lives here and re-wrapping necessarily decrypts locally.
+//
+// Callers that need to delegate a rotation sweep to a less-trusted process
+// should type-assert this interface rather than assuming every KeyManager
+// offers the stronger property. The method is additive and has the same
+// semantics and errors as KeyManager.RewrapDEK.
+type RewrapWithoutPlaintext interface {
+	RewrapDEKWithoutPlaintext(ctx context.Context, wrapped domain.WrappedDEK) (domain.WrappedDEK, error)
+}
+
 // KeyManager is the port every key manager adapter implements. See the
 // package doc comment and keyringtest.RunKeyManagerSuite for the full
 // contract.

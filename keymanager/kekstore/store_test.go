@@ -8,7 +8,7 @@ import (
 )
 
 func TestMemKEKStoreConformance(t *testing.T) {
-	keyringtest.RunKEKStoreSuite(t, func(t *testing.T) kekstore.KEKStore {
+	keyringtest.RunKEKStoreSuite(t, func(_ *testing.T) kekstore.KEKStore {
 		return kekstore.NewMemKEKStore()
 	})
 }

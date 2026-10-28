@@ -572,3 +572,27 @@ func TestKeyManagerValueRedactsTheDerivedWrappingKey(t *testing.T) {
 		}
 	}
 }
+
+func TestWrongAdapterFormatIsRejected(t *testing.T) {
+	t.Parallel()
+
+	km := newKeyManager(t, randomRootKey(t), local.NewMemKEKStore())
+	ctx := context.Background()
+	dek, err := keyring.NewDEK()
+	if err != nil {
+		t.Fatalf("NewDEK: %v", err)
+	}
+	t.Cleanup(dek.Destroy)
+
+	wrapped, err := km.WrapDEK(ctx, "kek-format", "key-1", dek)
+	if err != nil {
+		t.Fatalf("WrapDEK: %v", err)
+	}
+	wrapped.Format = keyring.WrappedDEKFormatOpenBaoTransit
+	if _, err := km.UnwrapDEK(ctx, wrapped); !errors.Is(err, keyring.ErrInvalidWrappedDEK) {
+		t.Fatalf("UnwrapDEK(wrong format) = %v, want ErrInvalidWrappedDEK", err)
+	}
+	if _, err := km.RewrapDEK(ctx, wrapped); !errors.Is(err, keyring.ErrInvalidWrappedDEK) {
+		t.Fatalf("RewrapDEK(wrong format) = %v, want ErrInvalidWrappedDEK", err)
+	}
+}

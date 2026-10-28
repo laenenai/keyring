@@ -448,6 +448,14 @@ func (k *KeyManager) UnwrapDEK(ctx context.Context, wrapped domain.WrappedDEK) (
 	return dek, nil
 }
 
+// RewrapDEKWithoutPlaintext implements keymanager.RewrapWithoutPlaintext.
+// It is the same server-side rewrap as RewrapDEK; the separate method is what
+// lets a caller require the stronger property without inspecting the adapter
+// type.
+func (k *KeyManager) RewrapDEKWithoutPlaintext(ctx context.Context, wrapped domain.WrappedDEK) (domain.WrappedDEK, error) {
+	return k.RewrapDEK(ctx, wrapped)
+}
+
 // RewrapDEK implements keymanager.KeyManager, over transit's rewrap endpoint.
 //
 // This is the method the adapter is shaped around. Transit rewraps server
@@ -927,6 +935,7 @@ func record(kekID domain.KEKID, keyID domain.KeyID, res *transitResponse) (domai
 		KEKID:      kekID,
 		KEKVersion: version,
 		KeyID:      keyID,
+		Format:     domain.WrappedDEKFormatOpenBaoTransit,
 		Ciphertext: []byte(res.Data.Ciphertext),
 	}
 	if err := wrapped.Validate(); err != nil {
@@ -946,6 +955,9 @@ func record(kekID domain.KEKID, keyID domain.KeyID, res *transitResponse) (domai
 // to fail; this is where it fails.
 func readableCiphertext(wrapped domain.WrappedDEK) (string, error) {
 	if err := wrapped.Validate(); err != nil {
+		return "", err
+	}
+	if err := wrapped.ValidateFormat(domain.WrappedDEKFormatOpenBaoTransit); err != nil {
 		return "", err
 	}
 	// Deliberately uninformative, exactly like a failed decrypt: which part
@@ -1046,7 +1058,10 @@ func isPrintableASCII(b []byte) bool {
 }
 
 // The adapter is held to the port at compile time.
-var _ keymanager.KeyManager = (*KeyManager)(nil)
+var (
+	_ keymanager.KeyManager             = (*KeyManager)(nil)
+	_ keymanager.RewrapWithoutPlaintext = (*KeyManager)(nil)
+)
 
 // String renders the manager without its token. A *KeyManager is what Open
 // returns, so it is in scope wherever Open's error handling is, and its token

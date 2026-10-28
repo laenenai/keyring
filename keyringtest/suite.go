@@ -85,6 +85,9 @@ func RunKeyManagerSuite(t *testing.T, newKM func(t *testing.T) keyring.KeyManage
 		if err := wrapped.Validate(); err != nil {
 			t.Fatalf("WrapDEK returned a record that does not validate: %v", err)
 		}
+		if wrapped.Format == keyring.WrappedDEKFormatLegacy {
+			t.Error("WrapDEK returned a record without an adapter format")
+		}
 		if wrapped.KEKID != kekID {
 			t.Errorf("wrapped.KEKID = %q, want %q", wrapped.KEKID, kekID)
 		}
@@ -183,6 +186,9 @@ func RunKeyManagerSuite(t *testing.T, newKM func(t *testing.T) keyring.KeyManage
 
 		if err := wrapped.Validate(); err != nil {
 			t.Fatalf("GenerateDEK returned a record that does not validate: %v", err)
+		}
+		if wrapped.Format == keyring.WrappedDEKFormatLegacy {
+			t.Error("GenerateDEK returned a record without an adapter format")
 		}
 		if wrapped.KEKID != kekID {
 			t.Errorf("wrapped.KEKID = %q, want %q", wrapped.KEKID, kekID)
