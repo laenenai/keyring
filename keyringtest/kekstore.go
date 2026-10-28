@@ -9,10 +9,10 @@ import (
 	"testing"
 
 	"github.com/laenenai/keyring"
-	"github.com/laenenai/keyring/keymanager/local"
+	"github.com/laenenai/keyring/keymanager/kekstore"
 )
 
-// RunKEKStoreSuite runs the contract every local.KEKStore implementation must
+// RunKEKStoreSuite runs the contract every kekstore.KEKStore implementation must
 // satisfy. newStore is called once per subtest, receiving that subtest's own
 // *T, so an implementation that needs per-test setup and teardown (a schema,
 // a transaction that rolls back, a connection pool) registers it with
@@ -35,7 +35,7 @@ import (
 // also why this suite stores byte sequences that are not valid UTF-8 and not
 // null-free: an implementation that put them in a text column would pass a
 // test written with friendlier fixtures and corrupt real key material.
-func RunKEKStoreSuite(t *testing.T, newStore func(t *testing.T) local.KEKStore) {
+func RunKEKStoreSuite(t *testing.T, newStore func(t *testing.T) kekstore.KEKStore) {
 	t.Helper()
 
 	t.Run("AbsentKEKIsErrKEKNotFound", func(t *testing.T) {
@@ -117,7 +117,7 @@ func RunKEKStoreSuite(t *testing.T, newStore func(t *testing.T) local.KEKStore) 
 		if err := store.CreateKEKVersion(ctx, id, keyring.FirstKEKVersion, first); err != nil {
 			t.Fatalf("CreateKEKVersion: %v", err)
 		}
-		if err := store.CreateKEKVersion(ctx, id, keyring.FirstKEKVersion, second); !errors.Is(err, local.ErrKEKVersionExists) {
+		if err := store.CreateKEKVersion(ctx, id, keyring.FirstKEKVersion, second); !errors.Is(err, kekstore.ErrKEKVersionExists) {
 			t.Fatalf("CreateKEKVersion of an existing version error = %v, want ErrKEKVersionExists", err)
 		}
 		got, err := store.WrappedKEK(ctx, id, keyring.FirstKEKVersion)
@@ -281,7 +281,7 @@ func RunKEKStoreSuite(t *testing.T, newStore func(t *testing.T) local.KEKStore) 
 			case err == nil:
 				winners++
 				winner = i
-			case errors.Is(err, local.ErrKEKVersionExists):
+			case errors.Is(err, kekstore.ErrKEKVersionExists):
 			default:
 				t.Errorf("goroutine %d: CreateKEKVersion error = %v, want nil or ErrKEKVersionExists", i, err)
 			}

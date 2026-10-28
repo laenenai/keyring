@@ -10,7 +10,7 @@
 //   - RunKeyManagerSuite, for keyring.KeyManager. Every adapter passes it:
 //     the in-process AES-GCM one, the OpenBao transit one, and an adapter a
 //     consumer writes against its own KMS.
-//   - RunKEKStoreSuite, for local.KEKStore, where the local adapter keeps
+//   - RunKEKStoreSuite, for kekstore.KEKStore, where the local adapter keeps
 //     wrapped KEK material. It exists so that the persistent implementation
 //     CAS design §8.3 calls for is held to exactly what the in-memory one
 //     does.
